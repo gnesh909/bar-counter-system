@@ -6,7 +6,20 @@ An all-in-one counter app for a bar: customer tabs, orders, stock and sales repo
 
 1. Open the app's GitHub Pages address in **Chrome** on the tablet.
 2. Tap the **⋮** menu, then **Add to Home screen** (or **Install app**).
-3. Open it from the home screen icon and sign in with the bar account. The first time, tap **Create bar account**; on every other device, sign in with the same email and password.
+3. Open it from the home screen icon. The very first time, tap **Create admin login**. On other devices, sign in with the admin login or a viewer login the admin created.
+
+## Logins
+
+| | Admin | Viewer |
+|---|---|---|
+| See customers, stock, reports, bills | ✓ | ✓ |
+| Take orders and payments, split/move, print, close the day | ✓ | ✓ |
+| Add or edit menu items, prices, restock | ✓ | |
+| Setup (service charge, SST, happy hour), restore backup, test data | ✓ | |
+| Remove a customer without charging, void or reopen a bill | ✓ | |
+| Create and remove logins (Setup → Logins) | ✓ | |
+
+The server enforces these rules, not just the screen.
 
 ## Where the data lives
 
@@ -14,7 +27,7 @@ Menu, stock, open customers and sales are stored in a private Supabase database 
 
 - **Sync:** changes show up on the other devices within a second or two. Stock counts add up correctly even when two devices sell the same item at once.
 - **Offline:** the app keeps working without internet. Changes wait on the device (the top bar shows "Offline · N waiting") and are sent when the connection returns.
-- **Privacy:** only someone signed in with the bar account can read or change the data.
+- **Privacy:** only the bar's own logins can read the data, and only within their role.
 - **Backup:** Setup → **Download backup** saves a file of the last 62 days. **Restore from backup** replaces the shared data on every device.
 - Supabase's free plan pauses a project after a week with no use at all. Daily use keeps it awake; if it ever pauses, it can be resumed from the Supabase dashboard.
 
@@ -41,6 +54,6 @@ Menu, stock, open customers and sales are stored in a private Supabase database 
 | `sw.js` | Offline support |
 | `icon-192.png`, `icon-512.png` | App icons |
 
-The database has one table, `bar_docs`, with row-level security, plus the functions `bar_put` and `bar_put_many`.
+The database has the tables `bars`, `bar_members` and `bar_docs` with row-level security; all writes go through the role-checked function `bar_put_many`.
 
 To update the app, change `index.html` and raise `VERSION` in `sw.js` so tablets pick up the new copy.

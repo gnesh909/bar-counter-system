@@ -313,6 +313,9 @@ function legacyClear() {
    (one per menu item, customer, bill and day closing, plus settings), compared with
    the last known copy, and only the differences are queued and sent. */
 let sb = null, user = lsGet("user", null), channel = null, online = false;
+if (user && !user.bar) user = null; /* saved by an older version: sign in again */
+const isAdmin = () => !!user && user.role === "admin";
+const ADMIN_ONLY = "Only the admin login can do that.";
 let docs = lsGet("docs", {}), queue = lsGet("queue", []), inflight = 0, flushT = null, commitQ = false;
 const DEV = lsGet("dev", null) || (() => { const d = "ABCDEFGHJKLMNPQRSTUVWXYZ"[Math.floor(Math.random() * 24)] + Math.floor(Math.random() * 10); lsSet("dev", d); return d; })();
 
@@ -371,10 +374,12 @@ async function flush() {
   const batch = queue.slice(0, 100).map(o => ({path: o.path, data: o.data, delta: o.isNew ? null : o.delta, del: !!o.del}));
   inflight = batch.length; setSync();
   try {
-    const {error} = await sb.rpc("bar_put_many", {p_ops: batch});
+    const {data: skipped, error} = await sb.rpc("bar_put_many", {p_bar: user.bar, p_ops: batch});
     if (error) throw error;
     queue.splice(0, inflight); inflight = 0; online = true; lsSet("queue", queue);
-    refreshItems(batch.filter(o => o.path.startsWith("item/") && !o.del).map(o => o.path)).catch(() => {});
+    /* Changes this login isn't allowed to make are refused by the server: put back the real values. */
+    if (skipped && skipped.length) toast(ADMIN_ONLY + " That change was undone.");
+    refreshDocs([...new Set([...(skipped || []), ...batch.filter(o => o.path.startsWith("item/") && !o.del).map(o => o.path)])]).catch(() => {});
     if (queue.length) return flush();
   } catch (e) {
     inflight = 0;
@@ -395,11 +400,14 @@ function applyRemote(row) {
 let renderT = null;
 /* Redraw the screen behind any open dialog; the dialog itself is left alone so typing is not lost. */
 function scheduleRender() { clearTimeout(renderT); renderT = setTimeout(render, 40); }
-/* After sending stock changes, read back the true totals (other devices may have sold the same item). */
-async function refreshItems(paths) {
+/* Read documents back from the server: true stock totals after a sale (other devices may have sold
+   the same item), and the real value of anything the server refused. */
+async function refreshDocs(paths) {
   if (!paths.length) return;
-  const {data, error} = await sb.from("bar_docs").select("path,data,deleted").in("path", paths);
-  if (!error && data) data.forEach(applyRemote);
+  const {data, error} = await sb.from("bar_docs").select("path,data,deleted").eq("bar_id", user.bar).in("path", paths);
+  if (error || !data) return;
+  data.forEach(applyRemote);
+  for (const p of paths) if (!data.some(r => r.path === p) && !queue.some(q => q.path === p) && docs[p]) { delete docs[p]; lsSet("docs", docs); fromDocs(); scheduleRender(); }
 }
 
 async function fullLoad() {
@@ -407,7 +415,7 @@ async function fullLoad() {
   const cutId = dayId(cut);
   const rows = [];
   for (let from = 0; ; from += 1000) {
-    const {data, error} = await sb.from("bar_docs").select("path,data,deleted").or(`path.not.like.bill/*,path.gte.bill/${cutId}`).range(from, from + 999);
+    const {data, error} = await sb.from("bar_docs").select("path,data,deleted").eq("bar_id", user.bar).or(`path.not.like.bill/*,path.gte.bill/${cutId}`).range(from, from + 999);
     if (error) throw error;
     rows.push(...data); if (data.length < 1000) break;
   }
@@ -425,7 +433,7 @@ async function fullLoad() {
 }
 /* First sign-in on a device that already has data from the one-tablet version. */
 async function migrateLegacy(serverCount) {
-  const old = legacyLoad(); if (!old) return;
+  const old = legacyLoad(); if (!old || !isAdmin()) return;
   if (serverCount && !window.confirm("This device has bar data from before syncing was added. Add it to the shared bar data? (Cancel keeps only the shared data.)")) { legacyClear(); return; }
   if (!serverCount) S.settings = old.settings;
   S.menu.items.push(...old.menu.items.filter(i => !item(i.id)));
@@ -441,13 +449,19 @@ async function migrateLegacy(serverCount) {
 async function connect() {
   if (!sb || !user) return;
   try {
+    /* The admin may have changed this login's role, or removed it. */
+    const me = await sb.rpc("bar_me");
+    if (me.error) throw me.error;
+    const row = me.data && me.data[0];
+    if (!row || row.bar_id !== user.bar) { await dropLocal(); note("This login no longer has access to the bar. Ask the admin."); return; }
+    if (row.role !== user.role) { user.role = row.role; lsSet("user", user); toast("This login is now " + (row.role === "admin" ? "an admin" : "a viewer") + "."); }
     const n = await fullLoad();
     online = true; note("");
     await migrateLegacy(n);
     render(); flush();
     if (channel) sb.removeChannel(channel);
     channel = sb.channel("bar-" + user.id)
-      .on("postgres_changes", {event: "*", schema: "public", table: "bar_docs", filter: "owner=eq." + user.id}, p => applyRemote(p.new))
+      .on("postgres_changes", {event: "*", schema: "public", table: "bar_docs", filter: "bar_id=eq." + user.bar}, p => applyRemote(p.new))
       .subscribe(st => { live = st === "SUBSCRIBED"; });
   } catch (e) {
     online = false; setSync();
@@ -458,20 +472,48 @@ async function connect() {
 let live = false, retryT = null;
 setInterval(() => { if (sb && user && !live && !inflight && document.visibilityState === "visible") fullLoad().then(() => { online = true; render(); flush(); }, () => { online = false; setSync(); }); }, 20000);
 async function signIn(email, password, create) {
-  const fn = create ? sb.auth.signUp({email, password}) : sb.auth.signInWithPassword({email, password});
-  const {data, error} = await fn;
+  const {data, error} = await (create ? sb.auth.signUp({email, password}) : sb.auth.signInWithPassword({email, password}));
   if (error) throw error;
   if (!data.session) throw new Error("Account created. Sign in now.");
-  if (user && user.id !== data.user.id) { docs = {}; queue = []; }
-  user = {id: data.user.id, email: data.user.email}; lsSet("user", user); lsSet("docs", docs); lsSet("queue", queue);
+  let me = await sb.rpc("bar_me"); if (me.error) throw me.error;
+  let row = me.data && me.data[0];
+  if (!row && create) {
+    /* The very first login creates the bar and becomes its admin. */
+    const c = await sb.rpc("bar_create", {p_name: "My Bar"}); if (c.error) { await sb.auth.signOut().catch(() => {}); throw c.error; }
+    me = await sb.rpc("bar_me"); row = me.data && me.data[0];
+  }
+  if (!row) { await sb.auth.signOut().catch(() => {}); throw new Error("NOACCESS"); }
+  if (user && (user.id !== data.user.id || user.bar !== row.bar_id)) { docs = {}; queue = []; }
+  user = {id: data.user.id, email: data.user.email, bar: row.bar_id, role: row.role};
+  lsSet("user", user); lsSet("docs", docs); lsSet("queue", queue);
   fromDocs(); ui.ready = true; await connect(); render();
+}
+async function dropLocal() {
+  try { if (channel) sb.removeChannel(channel); await sb.auth.signOut(); } catch (_) {}
+  user = null; docs = {}; queue = []; online = false; ui.members = null;
+  ["user", "docs", "queue"].forEach(k => localStorage.removeItem(KEY + k));
+  fromDocs(); ui.tab = null; modal(null); render();
 }
 async function signOut() {
   if (queue.length && !window.confirm(queue.length + " changes have not reached the server yet and will be lost. Sign out anyway?")) return;
-  try { if (channel) sb.removeChannel(channel); await sb.auth.signOut(); } catch (_) {}
-  user = null; docs = {}; queue = []; online = false;
-  ["user", "docs", "queue"].forEach(k => localStorage.removeItem(KEY + k));
-  fromDocs(); ui.tab = null; modal(null); render();
+  await dropLocal();
+}
+/* ---------- logins (admin) ---------- */
+async function loadMembers() {
+  const {data, error} = await sb.rpc("bar_members_list", {p_bar: user.bar});
+  ui.members = error ? [] : data;
+  if (ui.modal && ui.modal.kind === "settings") renderModal();
+}
+async function addLogin(email, password, role) {
+  /* A separate, throwaway connection creates the new login, so the admin stays signed in here. */
+  const tmp = window.supabase.createClient(SB_URL, SB_KEY, {auth: {persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: "bcs-tmp"}});
+  let res = await tmp.auth.signUp({email, password});
+  if (res.error && /already registered|already exists/i.test(res.error.message)) res = await tmp.auth.signInWithPassword({email, password});
+  if (res.error) throw res.error;
+  const uidNew = res.data.user && res.data.user.id; if (!uidNew) throw new Error("Could not create that login.");
+  const {error} = await sb.rpc("bar_add_member", {p_bar: user.bar, p_user: uidNew, p_role: role});
+  if (error) throw error;
+  await loadMembers();
 }
 
 function setSync() {
@@ -482,6 +524,7 @@ function setSync() {
   else if (!storeOk) { cls = " off"; txt = "Not saving"; }
   else if (!online) { cls = " busy"; txt = waiting ? "Offline · " + waiting + " waiting" : "Offline"; }
   else if (waiting) { cls = " busy"; txt = "Syncing " + waiting; }
+  if (user) txt += " · " + (isAdmin() ? "Admin" : "Viewer");
   el.className = "sync" + cls; el.lastElementChild.textContent = txt;
 }
 
@@ -647,7 +690,7 @@ function itemBtn(i, hh) {
 }
 function menuGrid() {
   const items = S.menu.items;
-  if (!items.length) return `<p class="empty">No drinks or food on the menu yet.<br><br><button class="primary" style="flex:none" data-a="item-new">Add your first item</button></p>`;
+  if (!items.length) return `<p class="empty">No drinks or food on the menu yet.<br><br>${isAdmin() ? `<button class="primary" style="flex:none" data-a="item-new">Add your first item</button>` : "The admin adds the menu under Stock."}</p>`;
   const cats = ["All", ...new Set(items.map(i => i.cat || "Other"))];
   if (!cats.includes(ui.cat)) ui.cat = "All";
   const hh = hhOn(S.settings), quick = quickItems();
@@ -702,7 +745,7 @@ function viewOrders() {
       <div class="tot big"><span>Total</span><span class="num">${rm(t.total)}</span></div>
       <div class="acts"><button class="primary" data-a="pay" ${has}>Take payment</button></div>
       <div class="acts"><button class="plain" data-a="split" ${has}>Split or move</button><button class="plain" data-a="print-open" ${has}>Print bill</button></div>
-      <div class="acts"><button class="plain" data-a="rename">Rename</button><button class="plain" data-a="void">Remove customer</button></div>
+      <div class="acts"><button class="plain" data-a="rename">Rename</button>${isAdmin() ? `<button class="plain" data-a="void">Remove customer</button>` : ""}</div>
   </aside>
   <div class="jump"><span><b>${esc(tab.name)}</b> · ${count} item${count === 1 ? "" : "s"} · <span class="num">${rm(t.total)}</span></span><button class="ghost" data-a="jump">View bill</button></div>
 </section>`;
@@ -712,7 +755,7 @@ function viewStock() {
   const low = items.filter(i => i.stock <= (i.low || 0)).length;
   const value = items.reduce((a, i) => a + Math.max(0, i.stock || 0) * (i.cost || 0), 0);
   const money = v => v ? (v / 100).toFixed(2) : "—";
-  return `<div class="bar"><h2>Stock and menu</h2><button class="primary" style="flex:none" data-a="item-new">Add item</button></div>
+  return `<div class="bar"><h2>Stock and menu</h2>${isAdmin() ? `<button class="primary" style="flex:none" data-a="item-new">Add item</button>` : `<span class="hint" style="margin:0">View only. The admin manages the menu and stock.</span>`}</div>
   <div class="tiles">
     <div class="tile"><span>Items</span><strong class="num">${items.length}</strong></div>
     <div class="tile"><span>Low or out</span><strong class="num" style="color:${low ? "var(--warn)" : "inherit"}">${low}</strong></div>
@@ -724,7 +767,7 @@ function viewStock() {
       return `<tr class="${k}"><td>${i.fav ? "★ " : ""}${esc(i.name)}</td><td>${esc(i.cat || "Other")}</td><td class="r num">${money(i.price)}</td><td class="r num">${money(i.hh)}</td><td class="r num">${money(i.dbl)}</td><td class="r num">${money(i.cost)}</td><td class="r num">${m}%</td>
       <td class="r num">${fmtStock(i)}${pours(i) > 1 ? ` <small style="color:var(--muted)">(${i.stock} pours)</small>` : ""}</td>
       <td><span class="pill ${k}">${s}</span></td>
-      <td class="r"><button class="ghost" data-a="restock" data-id="${i.id}">Restock</button> <button class="ghost" data-a="item-edit" data-id="${i.id}">Edit</button></td></tr>`; }).join("")}</tbody></table></div>`
+      <td class="r">${isAdmin() ? `<button class="ghost" data-a="restock" data-id="${i.id}">Restock</button> <button class="ghost" data-a="item-edit" data-id="${i.id}">Edit</button>` : ""}</td></tr>`; }).join("")}</tbody></table></div>`
   : `<p class="empty">Nothing here yet. Add your drinks and food, and how much you hold of each.</p>`}`;
 }
 function viewReports() {
@@ -760,23 +803,28 @@ function viewReports() {
   </div>`;
 }
 function viewSignIn() {
-  const can = !!sb;
-  return `<form data-f="signin" data-sb="${can}" class="dialog" style="margin:24px auto">
-    <h2>Sign in to your bar</h2>
-    <p class="hint">Use the same bar account on every tablet and phone. Orders, stock and sales stay in step on all of them.</p>
+  const can = !!sb, first = ui.barExists === false;
+  return `<form data-f="signin" data-k="${can}|${ui.barExists}" class="dialog" style="margin:24px auto">
+    <h2>${first ? "Set up your bar" : "Sign in to your bar"}</h2>
+    <p class="hint">${first ? "Create the admin login. The admin can then add a viewer login from Setup." : "Sign in with your admin or viewer login. Orders, stock and sales stay in step on every device."}</p>
     <div class="f">
       <label class="w" for="f-email">Email<input id="f-email" name="f-email" type="email" required autocomplete="username" value="${esc(ui.email || "")}"></label>
       <label class="w" for="f-pass">Password<input id="f-pass" name="f-pass" type="password" required minlength="8" autocomplete="current-password"></label>
       <p class="live w" id="authmsg" style="grid-column:1/-1;color:var(--warn)">${can ? "" : "Can't reach the sign-in service. Check the internet connection, then reload."}</p>
-      <div class="acts w"><button class="primary" type="submit" ${can ? "" : "disabled"}>Sign in</button><button class="ghost" type="submit" data-create="1" ${can ? "" : "disabled"}>Create bar account</button></div>
+      <div class="acts w">${first ? `<button class="primary" type="submit" data-create="1" ${can ? "" : "disabled"}>Create admin login</button>` : `<button class="primary" type="submit" ${can ? "" : "disabled"}>Sign in</button>`}</div>
     </div>
-    <p class="hint" style="margin:12px 0 0">First time? Pick an email and a password of at least 8 characters, then tap Create bar account. Use the same details to sign in on your other devices.</p>
+    <p class="hint" style="margin:12px 0 0">${first ? "Pick an email and a password of at least 8 characters. Use the same details to sign in as admin on any device." : "No login yet? Ask the admin to create one under Setup → Logins."}</p>
   </form>`;
 }
 function render() {
   $("#barname").textContent = S.settings.name || "My Bar";
   document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-current", b.dataset.v === ui.view));
-  if (!user) { const m = $("#main"), f = m.querySelector('form[data-f="signin"]'); if (!f || f.dataset.sb !== String(!!sb)) m.innerHTML = viewSignIn(); setSync(); return; }
+  if (!user) {
+    if (sb && ui.barExists === undefined) { ui.barExists = null; sb.rpc("bar_exists").then(r => { ui.barExists = r.error ? true : !!r.data; render(); }, () => { ui.barExists = true; render(); }); }
+    const m = $("#main"), f = m.querySelector('form[data-f="signin"]');
+    if (!f || f.dataset.k !== `${!!sb}|${ui.barExists}`) { const em = f && f.elements["f-email"] ? f.elements["f-email"].value : ""; m.innerHTML = viewSignIn(); if (em) m.querySelector("#f-email").value = em; }
+    setSync(); return;
+  }
   if (!ui.ready) return;
   if (ui.tab && !S.tabs.tabs[ui.tab]) ui.tab = null;
   const m = $("#main"), y = m.scrollTop, act = document.activeElement, aid = act && m.contains(act) ? act.id : "";
@@ -944,7 +992,7 @@ function renderModal() {
     if (!b) { ui.modal = null; box.innerHTML = ""; return; }
     h = `<h2>Bill ${esc(b.no)}</h2><div class="receipt" id="receipt">${esc(receiptText(b))}</div>
       <div class="acts"><button class="primary" data-a="print">Print receipt</button><button class="ghost" data-a="copy">Copy</button><button class="ghost" data-a="close">Done</button></div>
-      ${b.void ? "" : `<div class="acts"><button class="ghost" data-a="reopen">Reopen bill</button>${m.fresh ? "" : `<button class="danger" data-a="bill-void">Void this bill</button>`}</div>
+      ${b.void || !isAdmin() ? "" : `<div class="acts"><button class="ghost" data-a="reopen">Reopen bill</button>${m.fresh ? "" : `<button class="danger" data-a="bill-void">Void this bill</button>`}</div>
         <p class="hint" style="margin-bottom:0">Reopening cancels this payment and puts the items back on an open bill for ${esc(b.tab)}.</p>`}`;
   } else if (m.kind === "close") {
     const id = dayId(), day = S.days[id] || {bills: []}, r = summarise(day.bills || []), c = day.close || {};
@@ -963,7 +1011,7 @@ function renderModal() {
         <div class="acts w"><button class="primary" type="submit">Save closing</button><button class="ghost" type="submit" data-print="1">Save and print</button><button class="ghost" type="button" data-a="close">Cancel</button></div></form>`;
   } else if (m.kind === "settings") {
     const s = S.settings, hh = s.hh || DEF.hh, D = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    h = `<h2>Bar setup</h2><form data-f="settings" class="f">
+    h = `<h2>Bar setup</h2>${isAdmin() ? `<form data-f="settings" class="f">
       ${field("f-bar", "Bar name", s.name, "required maxlength=30", true)}
       ${field("f-svc", "Service charge %", s.svc, 'type="number" step="0.5" min="0" max="30" inputmode="decimal"')}
       ${field("f-tax", "SST %", s.tax, 'type="number" step="0.5" min="0" max="30" inputmode="decimal"')}
@@ -975,19 +1023,31 @@ function renderModal() {
       ${field("f-hhto", "Ends", hh.to, 'type="time"')}
       <div class="w days7" style="grid-column:1/-1">${D.map((d, n) => `<label for="f-d${n}"><input id="f-d${n}" name="f-d${n}" type="checkbox" ${(hh.days || []).includes(n) ? "checked" : ""}> ${d}</label>`).join("")}</div>
       <p class="hint w" style="grid-column:1/-1;margin:0">Only items with a happy hour price change. Set that price on each item under Stock.</p>
-      <div class="acts w"><button class="primary" type="submit">Save</button><button class="ghost" type="button" data-a="close">Cancel</button></div></form>
+      <div class="acts w"><button class="primary" type="submit">Save</button><button class="ghost" type="button" data-a="close">Cancel</button></div></form>`
+      : `<p class="hint">You are signed in as a <b>viewer</b>: you can see everything and take orders and payments. Prices, menu, stock levels and these settings are managed by the admin.</p>
+        <div class="tot"><span>Service charge</span><span class="num">${s.svc}%</span></div><div class="tot"><span>SST</span><span class="num">${s.tax}%</span></div>
+        <div class="tot"><span>Happy hour</span><span>${hh.on ? esc(hh.from) + "–" + esc(hh.to) : "Off"}</span></div>
+        <div class="acts"><button class="ghost" data-a="close">Close</button></div>`}
       <h3 style="font-size:18px;margin-top:18px">Account and sync</h3>
       <p class="hint">Signed in as <b>${esc(user ? user.email : "")}</b> on device ${esc(DEV)}. ${online ? (queue.length ? queue.length + " changes are being sent." : "Everything is synced.") : "Offline now" + (queue.length ? ": " + queue.length + " changes will be sent when the connection returns." : ".")}</p>
       <div class="acts"><button class="ghost" data-a="signout">Sign out of this device</button></div>
+      ${isAdmin() ? `<h3 style="font-size:18px;margin-top:18px">Logins</h3>
+      ${ui.members == null ? `<p class="hint">Loading logins…</p>` : ui.members.map(x => `<div class="selrow"><span>${esc(x.email || "")} <small>${x.role === "admin" ? "Admin" : "Viewer"}${x.user_id === user.id ? " · you" : ""}</small></span>${x.user_id === user.id ? "" : `<button class="danger" data-a="member-del" data-id="${x.user_id}">Remove</button>`}</div>`).join("")}
+      <form data-f="addlogin" class="f" style="margin-top:10px">
+        ${field("f-lemail", "New login email", "", 'type="email" required autocomplete="off"', true)}
+        ${field("f-lpass", "Password (at least 8 characters)", "", 'type="text" required minlength="8" autocomplete="off"')}
+        <label for="f-lrole">Role<select id="f-lrole" name="f-lrole"><option value="viewer">Viewer: sees all, takes orders</option><option value="admin">Admin: full control</option></select></label>
+        <p class="live w" id="loginmsg" style="grid-column:1/-1"></p>
+        <div class="acts w"><button class="primary" type="submit" style="flex:none">Create login</button></div></form>` : ""}
       <h3 style="font-size:18px;margin-top:18px">Backup</h3>
       <p class="hint">Your data is stored online and on each device. A backup file is still a good extra copy: download one now and then and keep it somewhere safe. This device holds the last ${KEEP_DAYS} days of sales, so that is what the backup includes. ${(() => { let t = 0; try { t = +localStorage.getItem(KEY + "lastBackup") || 0; } catch (_) {} return t ? "Last backup: " + new Date(t).toLocaleString() + "." : "No backup made yet."; })()}</p>
       <div class="acts"><button class="primary" style="flex:none" data-a="backup">Download backup</button>
-        <label class="ghost" for="f-restore" style="display:inline-flex;align-items:center">Restore from backup<input id="f-restore" type="file" accept=".json,application/json" hidden></label></div>
-      <h3 style="font-size:18px;margin-top:18px">Test data</h3>
+        ${isAdmin() ? `<label class="ghost" for="f-restore" style="display:inline-flex;align-items:center">Restore from backup<input id="f-restore" type="file" accept=".json,application/json" hidden></label>` : ""}</div>
+      ${isAdmin() ? `<h3 style="font-size:18px;margin-top:18px">Test data</h3>
       ${mockCount() ? `<p class="hint">Test data is loaded (${mockCount()} records). Removing it deletes only the test items, test customers and test bills. Your own menu and sales stay.</p>
         <div class="acts"><button class="danger" data-a="mock-del">Remove test data</button></div>`
       : `<p class="hint">Adds 20 sample drinks and food items, 5 open customers and 2 weeks of sales so you can try every screen. Everything added is marked as test data and can be removed in one tap.</p>
-        <div class="acts"><button class="ghost" data-a="mock-add">Load test data</button></div>`}`;
+        <div class="acts"><button class="ghost" data-a="mock-add">Load test data</button></div>`}` : ""}`;
   }
   const keep = box.querySelector(".dialog"), sy = keep ? keep.scrollTop : 0;
   box.innerHTML = `<div class="veil" data-a="veil"><div class="dialog" role="dialog" aria-modal="true">${h}</div></div>`;
@@ -1005,10 +1065,11 @@ function updateDiff() {
 /* ---------- events ---------- */
 let submitter = null;
 document.addEventListener("click", e => {
-  const sb = e.target.closest('button[type="submit"]'); if (sb) submitter = sb;
+  const subBtn = e.target.closest('button[type="submit"]'); if (subBtn) submitter = subBtn;
   const el = e.target.closest("[data-a]"); if (!el) return;
   const a = el.dataset.a, id = el.dataset.id, m = ui.modal;
   if (a === "veil") { if (e.target === el) modal(null); return; }
+  if (["item-new", "item-edit", "item-del", "restock", "void", "void-yes", "reopen", "bill-void", "mock-add", "mock-del", "member-del"].includes(a) && !isAdmin()) { toast(ADMIN_ONLY); return; }
   switch (a) {
     case "nav": ui.view = el.dataset.v; try { localStorage.setItem("bar-view", ui.view); } catch (_) {} $("#main").scrollTop = 0; break;
     case "tab": ui.tab = id; $("#main").scrollTop = 0; break;
@@ -1061,7 +1122,13 @@ document.addEventListener("click", e => {
     case "copy": { const txt = $("#receipt").textContent; (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => toast("Receipt copied"), () => toast("Copy is blocked here. Select the text instead.")); return; }
     case "print": { const b = ((S.days[m.day] || {}).bills || []).find(x => x.id === m.id); if (b) printText(receiptText(b), "bill-" + b.no); return; }
     case "print-open": { const t = curTab(); if (t && t.lines.length) printText(receiptText({open: true, t: Date.now(), tab: t.name, lines: t.lines, ...totals(t.lines, S.settings)}), "bill-" + t.name.replace(/[^A-Za-z0-9]+/g, "-").slice(0, 30)); return; }
-    case "settings": if (!user) return; return modal("settings", {});
+    case "settings": if (!user) return; if (isAdmin() && sb) { ui.members = null; loadMembers(); } return modal("settings", {});
+    case "member-del": {
+      const x = (ui.members || []).find(z => z.user_id === id);
+      if (!x || !window.confirm("Remove the login " + x.email + "? It will be signed out of the bar on every device.")) return;
+      sb.rpc("bar_remove_member", {p_bar: user.bar, p_user: id}).then(r => { if (r.error) toast(r.error.message); else { toast("Login removed"); loadMembers(); } });
+      return;
+    }
     case "backup": backupData(); return renderModal();
     case "signout": signOut(); return;
     case "mock-add": if (!ui.ready) return; loadMockData(); modal(null); toast("Test data loaded. Remove it any time from Setup."); break;
@@ -1085,6 +1152,7 @@ document.addEventListener("input", e => {
   }
 });
 document.addEventListener("change", e => {
+  if (e.target.id === "f-restore" && !isAdmin()) { toast(ADMIN_ONLY); return; }
   if (e.target.id === "f-restore" && e.target.files && e.target.files[0]) { restoreData(e.target.files[0]); e.target.value = ""; }
 });
 document.addEventListener("submit", e => {
@@ -1100,11 +1168,24 @@ document.addEventListener("submit", e => {
     btns.forEach(b => b.disabled = true); msg.textContent = create ? "Creating the account…" : "Signing in…";
     signIn(v("f-email"), f.elements["f-pass"].value, create).catch(err => {
       const t = String(err && err.message || err);
-      msg.textContent = /Invalid login/i.test(t) ? "Wrong email or password." : /already registered/i.test(t) ? "That email already has an account. Tap Sign in instead." : /fetch|network/i.test(t) ? "No internet connection. Connect, then try again." : t;
+      msg.textContent = /Invalid login/i.test(t) ? "Wrong email or password." : /already registered/i.test(t) ? "That email already has a login. Use Sign in." : t === "NOACCESS" ? "This login hasn't been given access yet. Ask the admin to add it under Setup → Logins." : /bar already exists/i.test(t) ? "The bar is already set up. Sign in with your login instead." : /fetch|network/i.test(t) ? "No internet connection. Connect, then try again." : t;
+      if (/bar already exists/i.test(t)) { ui.barExists = true; setTimeout(render, 1500); }
       btns.forEach(b => b.disabled = false);
     });
     return;
   }
+  if (kind === "addlogin") {
+    const msg = $("#loginmsg"), btn = f.querySelector("button");
+    if (!isAdmin()) { msg.textContent = ADMIN_ONLY; return; }
+    btn.disabled = true; msg.textContent = "Creating the login…";
+    addLogin(v("f-lemail"), f.elements["f-lpass"].value, f.elements["f-lrole"].value).then(() => toast("Login created. Sign in with it on the other device."), err => {
+      const t = String(err && err.message || err);
+      const m2 = $("#loginmsg"); if (m2) m2.textContent = /Invalid login/i.test(t) ? "That email already has a login with a different password. Use its existing password, or another email." : /another bar/i.test(t) ? "That login belongs to a different bar." : /fetch|network/i.test(t) ? "No internet connection." : t;
+      const b2 = document.querySelector('form[data-f="addlogin"] button'); if (b2) b2.disabled = false;
+    });
+    return;
+  }
+  if ((kind === "item" || kind === "restock" || kind === "settings") && !isAdmin()) { toast(ADMIN_ONLY); modal(null); return; }
   if (kind === "item") {
     const p = Math.max(1, parseInt(v("f-pours"), 10) || 1), ucost = toSen(v("f-ucost"));
     const d = {name: v("f-name"), cat: v("f-cat") || "Other", price: toSen(v("f-price")), hh: toSen(v("f-hh")), dbl: toSen(v("f-dbl")), pours: p, ucost, cost: Math.round(ucost / p),
