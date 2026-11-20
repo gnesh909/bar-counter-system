@@ -278,7 +278,7 @@ function hhOn(set, now) {
 
 /* ---------- state ---------- */
 const DEF = {name: "My Bar", email: "", svc: 10, tax: 6, round5: true, cut: 5, hh: {on: false, from: "17:00", to: "20:00", days: [0, 1, 2, 3, 4, 5, 6]}};
-const S = {menu: {items: []}, tabs: {tabs: {}}, settings: clone(DEF), days: {}};
+const S = {menu: {items: []}, tabs: {tabs: {}}, settings: clone(DEF), days: {}, custs: {}};
 const ui = {view: "orders", rmode: "day", ranchor: null, rep: null, hist: null, backups: null, mailer: false, tab: null, cat: "All", range: 1, modal: null, ready: false, q: "", sort: "arrival"};
 /* Data is shared through Supabase. Each device also keeps a copy in localStorage ("bcs:" keys),
    so it opens and takes orders with no internet; queued changes are sent when the connection returns. */
@@ -330,6 +330,7 @@ function toDocs() {
   const d = {settings: S.settings};
   S.menu.items.forEach((it, i) => { d["item/" + it.id] = {...it, order: i}; });
   for (const t of Object.values(S.tabs.tabs)) d["tab/" + t.id] = t;
+  for (const c of Object.values(S.custs || {})) d["cust/" + c.id] = c;
   for (const id in S.days) {
     const day = S.days[id];
     for (const b of day.bills || []) d["bill/" + id + "/" + b.id] = b;
@@ -339,18 +340,19 @@ function toDocs() {
 }
 function fromDocs() { Object.assign(S, docsToState(docs)); }
 function docsToState(src) {
-  const items = [], tabs = {}, days = {};
+  const items = [], tabs = {}, days = {}, custs = {};
   const dayOf = id => days[id] || (days[id] = {bills: []});
   for (const p in src) {
     const v = src[p];
     if (p.startsWith("item/")) items.push(clone(v));
     else if (p.startsWith("tab/")) tabs[v.id] = clone(v);
+    else if (p.startsWith("cust/")) custs[v.id] = clone(v);
     else if (p.startsWith("bill/")) dayOf(p.split("/")[1]).bills.push(clone(v));
     else if (p.startsWith("close/")) dayOf(p.slice(6)).close = clone(v);
   }
   items.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   for (const id in days) days[id].bills.sort((a, b) => a.t - b.t);
-  return {settings: {...clone(DEF), ...clone(src.settings || {})}, menu: {items}, tabs: {tabs}, days};
+  return {settings: {...clone(DEF), ...clone(src.settings || {})}, menu: {items}, tabs: {tabs}, days, custs};
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function commit() {
@@ -583,9 +585,14 @@ const item = id => S.menu.items.find(i => i.id === id);
 const curTab = () => S.tabs.tabs[ui.tab] || null;
 const lkey = l => l.key || l.id;
 const pours = it => Math.max(1, it.pours || 1);
+const tracked = it => !!it && !it.nostock;
+const tidy = n => String(n || "").trim().replace(/\s+/g, " ");
+const findRegular = name => { const k = tidy(name).toLowerCase(); return Object.values(S.custs || {}).find(c => tidy(c.name).toLowerCase() === k) || null; };
 function makeTab(name) {
-  const id = uid(), n = Object.keys(S.tabs.tabs).length + 1;
-  return S.tabs.tabs[id] = {id, name: name || "Customer " + n, opened: Date.now(), lines: []};
+  const id = uid(), n = Object.keys(S.tabs.tabs).length + 1, reg = findRegular(name);
+  const t = {id, name: reg ? reg.name : (tidy(name) || "Customer " + n), opened: Date.now(), lines: []};
+  if (reg) t.cid = reg.id;
+  return S.tabs.tabs[id] = t;
 }
 function newTab(name) { const t = makeTab(name); ui.tab = t.id; saveTabs(); return t; }
 function addItem(id, dbl) {
@@ -597,15 +604,17 @@ function addItem(id, dbl) {
   const l = tab.lines.find(x => lkey(x) === key);
   if (l) l.qty++;
   else tab.lines.push({key, id, name: it.name + (dbl ? " (double)" : "") + (hh ? " (happy hour)" : ""), price: dbl ? it.dbl : hh ? it.hh : it.price, cost: (it.cost || 0) * units, units, qty: 1});
-  it.stock = (it.stock || 0) - units;
-  if (it.stock < 0) toast(it.name + ": stock count is below zero. Recount it.");
+  if (tracked(it)) {
+    it.stock = (it.stock || 0) - units;
+    if (it.stock < 0) toast(it.name + ": stock count is below zero. Recount it.");
+  }
   saveTabs(); saveMenu();
 }
 function changeQty(key, d) {
   const tab = curTab(); if (!tab) return;
   const l = tab.lines.find(x => lkey(x) === key); if (!l) return;
   l.qty += d;
-  const it = item(l.id); if (it) it.stock = (it.stock || 0) - d * (l.units || 1);
+  const it = item(l.id); if (tracked(it)) it.stock = (it.stock || 0) - d * (l.units || 1);
   if (l.qty <= 0) tab.lines = tab.lines.filter(x => x !== l);
   saveTabs(); saveMenu();
 }
@@ -617,7 +626,7 @@ function toggleDouble(key) {
 }
 function voidTab() {
   const tab = curTab(); if (!tab) return;
-  for (const l of tab.lines) { const it = item(l.id); if (it) it.stock = (it.stock || 0) + l.qty * (l.units || 1); }
+  for (const l of tab.lines) { const it = item(l.id); if (tracked(it)) it.stock = (it.stock || 0) + l.qty * (l.units || 1); }
   delete S.tabs.tabs[tab.id]; ui.tab = null;
   saveTabs(); saveMenu();
 }
@@ -647,6 +656,7 @@ function closeBill(method, tendered, sel) {
   const id = dayId(), day = S.days[id] || (S.days[id] = {bills: []});
   const t = totals(lines, S.settings, method);
   const bill = {id: uid(), no: id.slice(5).replace("-", "") + "-" + pad(day.bills.length + 1) + DEV, t: Date.now(), tab: tab.name, lines, ...t, pay: method};
+  if (tab.cid) bill.cid = tab.cid;
   if (method === "cash" && tendered) { bill.tendered = tendered; bill.change = tendered - t.total; }
   day.bills.push(bill);
   if (sel) takeLines(tab, sel); else { delete S.tabs.tabs[tab.id]; ui.tab = null; }
@@ -691,11 +701,13 @@ function printText(text) {
 
 /* ---------- views ---------- */
 function fmtStock(i) {
+  if (!tracked(i)) return "—";
   const p = pours(i), s = i.stock || 0;
   if (p === 1 || s < 0) return String(s);
   return Math.floor(s / p) + " btl + " + (s % p);
 }
-const status = it => it.stock <= 0 ? ["crit", "Out"] : it.stock <= (it.low || 0) ? ["warn", "Low"] : ["ok", "OK"];
+const status = it => !tracked(it) ? ["ok", "Not tracked"] : it.stock <= 0 ? ["crit", "Out"] : it.stock <= (it.low || 0) ? ["warn", "Low"] : ["ok", "OK"];
+const needsStock = it => tracked(it) && it.stock <= (it.low || 0);
 function rangeDays(n) { const out = [], d = bizDate(); for (let i = n - 1; i >= 0; i--) { const x = new Date(d); x.setDate(d.getDate() - i); out.push(dayId(x)); } return out; }
 function quickItems() {
   const sold = summarise(rangeDays(30).flatMap(id => (S.days[id] || {}).bills || [])).ids;
@@ -725,7 +737,7 @@ function custCards() {
   tabs.sort(ui.sort === "name" ? (a, b) => a.name.localeCompare(b.name) : ui.sort === "amount" ? (a, b) => amt(b) - amt(a) : (a, b) => a.opened - b.opened);
   if (!tabs.length) return `<p class="empty">${q ? "No customer matches that name." : "No customers yet. Type a name above and press Add customer."}</p>`;
   return tabs.map(x => { const n = x.lines.reduce((a, l) => a + l.qty, 0);
-    return `<button class="cust" data-a="tab" data-id="${x.id}"><b>${esc(x.name)}</b>
+    return `<button class="cust" data-a="tab" data-id="${x.id}"><b>${x.cid ? "★ " : ""}${esc(x.name)}</b>
       <span class="what">${n ? esc(x.lines.map(l => l.qty + " " + l.name).join(", ")) : "Nothing ordered yet"}</span>
       <span class="row"><small>Since ${hhmm(x.opened)} · ${n} item${n === 1 ? "" : "s"}</small><span class="price num">${rm(amt(x))}</span></span></button>`; }).join("");
 }
@@ -734,7 +746,8 @@ function viewCustomers() {
   const open = tabs.reduce((a, x) => a + totals(x.lines, S.settings).total, 0);
   return `<form data-f="tabname" class="addc">
       <label for="f-tab">New customer</label>
-      <input id="f-tab" name="f-tab" required maxlength="30" autocomplete="off" placeholder="Customer name or table">
+      <input id="f-tab" name="f-tab" required maxlength="30" autocomplete="off" list="regulars" placeholder="Customer name or table">
+      <datalist id="regulars">${Object.values(S.custs || {}).sort((a, b) => a.name.localeCompare(b.name)).map(c => `<option value="${esc(c.name)}">`).join("")}</datalist>
       <button class="primary" type="submit">Add customer</button>
     </form>
     <div class="bar"><h2>Customers in the bar</h2><span class="num" style="color:var(--muted)">${tabs.length} open · ${rm(open)} unpaid</span></div>
@@ -771,8 +784,8 @@ function viewOrders() {
 }
 function viewStock() {
   const items = [...S.menu.items].sort((a, b) => (a.cat || "").localeCompare(b.cat || "") || a.name.localeCompare(b.name));
-  const low = items.filter(i => i.stock <= (i.low || 0)).length;
-  const value = items.reduce((a, i) => a + Math.max(0, i.stock || 0) * (i.cost || 0), 0);
+  const low = items.filter(needsStock).length;
+  const value = items.filter(tracked).reduce((a, i) => a + Math.max(0, i.stock || 0) * (i.cost || 0), 0);
   const money = v => v ? (v / 100).toFixed(2) : "—";
   return `<div class="bar"><h2>Stock and menu</h2>${isAdmin() ? `<button class="primary" style="flex:none" data-a="item-new">Add item</button>` : `<span class="hint" style="margin:0">View only. The admin manages the menu and stock.</span>`}</div>
   <div class="tiles">
@@ -784,9 +797,9 @@ function viewStock() {
     <thead><tr><th>Item</th><th>Category</th><th class="r">Price</th><th class="r">Happy hr</th><th class="r">Double</th><th class="r">Cost / serving</th><th class="r">Margin</th><th class="r">Left</th><th>Status</th><th></th></tr></thead>
     <tbody>${items.map(i => { const [k, s] = status(i); const m = i.price ? Math.round((i.price - (i.cost || 0)) / i.price * 100) : 0;
       return `<tr class="${k}"><td>${i.fav ? "★ " : ""}${esc(i.name)}</td><td>${esc(i.cat || "Other")}</td><td class="r num">${money(i.price)}</td><td class="r num">${money(i.hh)}</td><td class="r num">${money(i.dbl)}</td><td class="r num">${money(i.cost)}</td><td class="r num">${m}%</td>
-      <td class="r num">${fmtStock(i)}${pours(i) > 1 ? ` <small style="color:var(--muted)">(${i.stock} pours)</small>` : ""}</td>
+      <td class="r num">${fmtStock(i)}${tracked(i) && pours(i) > 1 ? ` <small style="color:var(--muted)">(${i.stock} pours)</small>` : ""}</td>
       <td><span class="pill ${k}">${s}</span></td>
-      <td class="r">${isAdmin() ? `<button class="ghost" data-a="restock" data-id="${i.id}">Restock</button> <button class="ghost" data-a="item-edit" data-id="${i.id}">Edit</button>` : ""}</td></tr>`; }).join("")}</tbody></table></div>`
+      <td class="r">${isAdmin() ? `${tracked(i) ? `<button class="ghost" data-a="restock" data-id="${i.id}">Restock</button> ` : ""}<button class="ghost" data-a="item-edit" data-id="${i.id}">Edit</button>` : ""}</td></tr>`; }).join("")}</tbody></table></div>`
   : `<p class="empty">Nothing here yet. Add your drinks and food, and how much you hold of each.</p>`}`;
 }
 /* ---------- reports ---------- */
@@ -841,6 +854,53 @@ async function loadReport(P) {
   ui.rep = error ? local() : {key, data, at: Date.now()};
   if (ui.view === "reports" && !ui.modal) render();
 }
+/* ---------- customer spending ---------- */
+const custKey = b => b.cid ? "id:" + b.cid : "n:" + tidy(b.tab).toLowerCase();
+function localCustomers(from, to) {
+  const m = {};
+  for (const id in S.days) {
+    if (id < from || id > to) continue;
+    for (const b of S.days[id].bills || []) {
+      if (b.void) continue;
+      const k = custKey(b), r = m[k] || (m[k] = {key: k, cid: b.cid || null, name: b.tab, bills: 0, days: new Set(), spent: 0, last: id, t: 0, items: {}});
+      r.bills++; r.days.add(id); r.spent += b.total; if (id > r.last) r.last = id; if (b.t > r.t) { r.t = b.t; r.name = b.tab; }
+      for (const l of b.lines) r.items[l.name] = (r.items[l.name] || 0) + l.qty;
+    }
+  }
+  return Object.values(m).map(r => ({key: r.key, cid: r.cid, name: r.name, bills: r.bills, visits: r.days.size, spent: r.spent, avg: Math.round(r.spent / r.bills), last: r.last,
+    fav: Object.entries(r.items).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, qty]) => ({name, qty}))})).sort((a, b) => b.spent - a.spent);
+}
+async function loadCustomers(P) {
+  const key = ui.rmode + P.from, local = () => ({key, rows: localCustomers(P.from, P.to), at: Date.now(), local: true});
+  if (!(sb && user && online)) { ui.cust = local(); return; }
+  ui.cust = {...local(), loading: true};
+  const {data, error} = await sb.rpc("bar_customers", {p_bar: user.bar, p_from: P.from, p_to: P.to});
+  if (!ui.cust || ui.cust.key !== key) return;
+  ui.cust = error ? local() : {key, rows: data, at: Date.now()};
+  if (ui.view === "reports" && !ui.modal) render();
+}
+const custName = r => (r.cid && S.custs[r.cid] ? S.custs[r.cid].name : tidy(r.name)) || "(no name)";
+function customersCard(P) {
+  const key = ui.rmode + P.from;
+  if (!ui.cust || ui.cust.key !== key || (!ui.cust.loading && ui.cust.at < billsAt)) loadCustomers(P);
+  let rows = ui.cust.rows || [];
+  if (ui.custRegs) rows = rows.filter(r => r.cid);
+  const top = rows.slice(0, 25);
+  return `<div class="card" style="grid-column:1/-1"><div class="bar" style="margin-bottom:8px"><h3 style="margin:0">Customer spending</h3>
+    <button class="ghost" data-a="cregs" aria-pressed="${!!ui.custRegs}">${ui.custRegs ? "Showing regulars only" : "Showing everyone"}</button></div>
+    ${top.length ? `<div class="scroll" style="border:0"><table style="min-width:0"><thead><tr><th>Customer</th><th class="r">Visits</th><th class="r">Bills</th><th class="r">Spent</th><th class="r">Average bill</th><th>Last visit</th><th>Favourites</th></tr></thead><tbody>
+      ${top.map(r => `<tr data-a="cshow" data-id="${esc(r.key)}" style="cursor:pointer"><td>${r.cid ? "★ " : ""}${esc(custName(r))}</td><td class="r num">${r.visits}</td><td class="r num">${r.bills}</td><td class="r num"><b>${rm(+r.spent)}</b></td><td class="r num">${rm(+r.avg)}</td><td>${keyLabel(r.last, "day")}</td><td style="white-space:normal;color:var(--muted)">${esc((r.fav || []).map(f => `${+f.qty} ${f.name}`).join(", "))}</td></tr>`).join("")}
+    </tbody></table></div><p class="hint" style="margin:8px 0 0">Tap a customer to see their bills. ★ = saved regular. ${rows.length > 25 ? "Top 25 of " + rows.length + "." : ""}</p>`
+    : `<p class="empty">${ui.custRegs ? "No regulars came in during this period." : "No sales in this period."}</p>`}</div>`;
+}
+async function openCustomer(r) {
+  const P = period();
+  modal("cust", {r, P, bills: null});
+  let bills;
+  if (sb && user && online) { const {data, error} = await sb.rpc("bar_customer_bills", {p_bar: user.bar, p_from: P.from, p_to: P.to, p_key: r.key}); if (!error) bills = data; }
+  if (!bills) bills = Object.entries(S.days).filter(([id]) => id >= P.from && id <= P.to).flatMap(([id, d]) => (d.bills || []).filter(b => !b.void && custKey(b) === r.key).map(b => ({...b, day: id}))).sort((a, b) => b.t - a.t);
+  if (ui.modal && ui.modal.kind === "cust" && ui.modal.r === r) { ui.modal.bills = bills; renderModal(); }
+}
 function repTotals(rows) {
   const t = {sales: 0, net: 0, bills: 0, voids: 0, cash: 0, card: 0, ewallet: 0, profit: 0, cogs: 0, units: 0};
   for (const r of rows) for (const k in t) t[k] += +r[k] || 0;
@@ -854,7 +914,7 @@ function viewReports() {
   const vals = P.keys.map(k => +(byK[k] || {}).sales || 0), maxV = Math.max(1, ...vals);
   const margin = T.sales ? Math.round(T.profit / T.net * 100) : 0;
   const payTotal = Math.max(1, T.sales), maxTop = R.items.length ? +R.items[0].amt : 1;
-  const lowItems = S.menu.items.filter(i => i.stock <= (i.low || 0));
+  const lowItems = S.menu.items.filter(needsStock);
   const isDay = ui.rmode === "day", isToday = isDay && P.from === today;
   const c = isDay ? (S.days[P.from] || {}).close : null;
   const dayBills = isDay ? ((S.days[P.from] || {}).bills || []).slice().reverse() : [];
@@ -884,6 +944,7 @@ function viewReports() {
     ${isDay ? `<div class="card bills"><h3>Bills</h3>${dayBills.length ? dayBills.map(b => `<button data-a="bill" data-id="${P.from}|${b.id}" class="${b.void ? "void" : ""}"><span class="num">${hhmm(b.t)}</span><span>${esc(b.tab)}</span><span class="num">${rm(b.total)}</span></button>`).join("") : `<p class="empty">No bills on this device for this day.</p>`}</div>`
     : `<div class="card" style="grid-column:1/-1"><h3>${P.group === "month" ? "Month by month" : "Day by day"}</h3>${rowsTable ? `<div class="scroll" style="border:0"><table style="min-width:0"><thead><tr><th>${P.group === "month" ? "Month" : "Day"}</th><th class="r">Bills</th><th class="r">Takings</th><th class="r">Profit</th><th class="r">Margin</th></tr></thead><tbody>${rowsTable}
       <tr><td><b>Total</b></td><td class="r num"><b>${T.bills}</b></td><td class="r num"><b>${rm(T.sales)}</b></td><td class="r num"><b>${rm(T.profit)}</b></td><td class="r num"><b>${margin}%</b></td></tr></tbody></table></div>` : `<p class="empty">No sales in this period.</p>`}</div>`}
+    ${customersCard(P)}
   </div>`;
 }
 /* Printable A4 report (also used as the email body). */
@@ -907,6 +968,8 @@ function reportHTML() {
     ${row(["<b>Total</b>", "<b>" + T.bills + "</b>", "<b>" + rm(T.sales) + "</b>", "<b>" + rm(T.profit) + "</b>"])}</table>`}
   <h2 style="font-size:16px;margin:16px 0 6px">Best sellers</h2>
   <table style="border-collapse:collapse;width:100%;font-size:13px">${row(["Item", "Qty", "Sales", "Profit"], true)}${R.items.map(i => row([esc(i.name), +i.qty, rm(+i.amt), rm(+i.profit)])).join("") || row(["No sales", "", "", ""])}</table>
+  ${(() => { const cs = ui.cust && ui.cust.key === ui.rmode + P.from ? ui.cust.rows : localCustomers(P.from, P.to); return cs.length ? `<h2 style="font-size:16px;margin:16px 0 6px">Top customers</h2>
+  <table style="border-collapse:collapse;width:100%;font-size:13px">${row(["Customer", "Visits", "Bills", "Spent"], true)}${cs.slice(0, 15).map(c => row([(c.cid ? "★ " : "") + esc(custName(c)), c.visits, c.bills, rm(+c.spent)])).join("")}</table>` : ""; })()}
   </div>`;
 }
 function reportText() {
@@ -916,6 +979,8 @@ function reportText() {
     line("Cash", rm(T.cash)), line("Card", rm(T.card)), line("E-wallet / QR", rm(T.ewallet))];
   if (ui.rmode !== "day") { out.push("-".repeat(w)); for (const r of R.rows) out.push(line(keyLabel(r.k, P.group), rm(+r.sales))); }
   out.push("-".repeat(w), "Best sellers"); for (const i of R.items.slice(0, 10)) out.push(line(`${+i.qty} x ${i.name}`.slice(0, w - 12), rm(+i.amt)));
+  const cs = ui.cust && ui.cust.key === ui.rmode + P.from ? ui.cust.rows : localCustomers(P.from, P.to);
+  if (cs.length) { out.push("-".repeat(w), "Top customers"); for (const c of cs.slice(0, 10)) out.push(line(custName(c).slice(0, w - 12), rm(+c.spent))); }
   return out.join("\n");
 }
 function printDoc(html, what) {
@@ -1029,7 +1094,7 @@ async function loadHistory(more) {
   else { h.error = ""; h.rows = more ? h.rows.concat(data) : data; h.done = data.length < 100; }
   if (ui.view === "history" && !ui.modal) render();
 }
-const LBL = {name: "name", cat: "category", price: "price", hh: "happy hour price", dbl: "double price", cost: "cost", ucost: "unit cost", pours: "pours", low: "warn level", stock: "stock", fav: "quick key",
+const LBL = {name: "name", cat: "category", price: "price", hh: "happy hour price", dbl: "double price", cost: "cost", ucost: "unit cost", pours: "pours", low: "warn level", stock: "stock", fav: "quick key", nostock: "don't track stock", phone: "phone",
   email: "bar email", svc: "service charge", tax: "SST", round5: "cash rounding", cut: "day ends at", hh_: "happy hour"};
 function fmtVal(k, v) {
   if (v == null || v === "") return "—";
@@ -1057,7 +1122,7 @@ function describe(h) {
     if (h.action === "create") return `Added menu item ${n} at ${rm(+a.price || 0)}, stock ${a.stock ?? 0}`;
     if (h.action === "delete") return `Removed menu item ${n}`;
     if (h.action === "stock") return `Stock of ${n}: ${b.stock} → ${a.stock}`;
-    return ref + `${n}: ` + (diff(["name", "cat", "price", "hh", "dbl", "cost", "ucost", "pours", "low", "stock", "fav"]).join(", ") || "changed");
+    return ref + `${n}: ` + (diff(["name", "cat", "price", "hh", "dbl", "cost", "ucost", "pours", "low", "stock", "fav", "nostock"]).join(", ") || "changed");
   }
   if (p.startsWith("tab/")) {
     const n = a.name || b.name || "customer";
@@ -1074,6 +1139,12 @@ function describe(h) {
     if (h.action === "delete") return `Deleted bill ${b.no || ""}`;
     if (a.void && !b.void) return ref + `${a.reopened ? "Reopened" : "Voided"} bill ${a.no || ""} for ${a.tab || ""} (${rm(+a.total || 0)})`;
     return ref + `Changed bill ${a.no || b.no || ""}`;
+  }
+  if (p.startsWith("cust/")) {
+    const n = a.name || b.name || "customer";
+    if (h.action === "create") return ref + `Saved regular customer ${n}${a.phone ? " (" + a.phone + ")" : ""}`;
+    if (h.action === "delete") return `Removed regular customer ${n}`;
+    return ref + `Regular ${n}: ` + (diff(["name", "phone"]).join(", ") || "updated");
   }
   if (p.startsWith("close/")) return `Day closing ${p.slice(6)}: counted ${rm(+a.counted || 0)}, ${a.diff === 0 ? "balanced" : a.diff < 0 ? "short " + rm(-a.diff) : "over " + rm(a.diff)}`;
   if (p === "settings") return ref + "Setup: " + (diff(["name", "email", "svc", "tax", "round5", "cut"]).concat(JSON.stringify(a.hh) !== JSON.stringify(b.hh) ? ["happy hour changed"] : []).join(", ") || "saved");
@@ -1251,6 +1322,7 @@ function renderModal() {
       ${field("f-stock", "In stock (bottles or units)", units(i.stock), 'inputmode="decimal" type="number" step="0.01"')}
       ${field("f-low", "Warn me at (bottles or units)", units(i.low ?? 5), dec)}
       ${check("f-fav", "Pin to the quick keys row", i.fav)}
+      ${check("f-nostock", "Don't track stock (pool table, karaoke, corkage and other services)", i.nostock)}
       <div class="acts w"><button class="primary" type="submit">Save</button><button class="ghost" type="button" data-a="close">Cancel</button>${m.id ? `<button class="danger" type="button" data-a="item-del" data-id="${m.id}">Remove from menu</button>` : ""}</div></form>`;
   } else if (m.kind === "restock") {
     const i = item(m.id), p = pours(i);
@@ -1312,6 +1384,16 @@ function renderModal() {
         ${field("f-counted", "Cash counted in drawer (RM)", c.counted != null ? (c.counted / 100).toFixed(2) : "", "required " + dec)}
         <p id="diff" class="live w" style="grid-column:1/-1"></p>
         <div class="acts w"><button class="primary" type="submit">Save closing</button><button class="ghost" type="submit" data-print="1">Save and print</button><button class="ghost" type="button" data-a="close">Cancel</button></div></form>`;
+  } else if (m.kind === "cust") {
+    const r = m.r, bills = m.bills;
+    h = `<h2>${r.cid ? "★ " : ""}${esc(custName(r))}</h2><p class="hint">${esc(m.P.label)}${r.cid && S.custs[r.cid] && S.custs[r.cid].phone ? " · " + esc(S.custs[r.cid].phone) : ""}</p>
+      <div class="tot"><span>Spent</span><b class="num">${rm(+r.spent)}</b></div>
+      <div class="tot"><span>Visits · bills</span><span class="num">${r.visits} · ${r.bills}</span></div>
+      <div class="tot"><span>Average bill</span><span class="num">${rm(+r.avg)}</span></div>
+      <div class="tot"><span>Favourites</span><span>${esc((r.fav || []).map(f => `${+f.qty} ${f.name}`).join(", ") || "—")}</span></div>
+      <h3 style="font-size:18px;margin:14px 0 6px">Bills</h3>
+      <div class="bills">${bills == null ? `<p class="hint">Loading…</p>` : bills.length ? bills.map(b => `<div style="padding:7px 0;border-bottom:1px solid var(--line)"><div class="tot"><span class="num">${keyLabel(b.day, "day")} ${hhmm(b.t)} · ${esc(b.no || "")}</span><b class="num">${rm(b.total)}</b></div><small style="color:var(--muted)">${esc((b.lines || []).map(l => l.qty + " " + l.name).join(", "))} · ${PAY[b.pay] || b.pay}</small></div>`).join("") : `<p class="hint">No bills found.</p>`}</div>
+      <div class="acts"><button class="ghost" data-a="close">Close</button></div>`;
   } else if (m.kind === "newpass") {
     h = `<h2>Choose a new password</h2><form data-f="newpass" class="f">
       ${field("f-rp1", "New password (at least 8 characters)", "", 'type="password" minlength="8" required autofocus autocomplete="new-password"', true)}
@@ -1360,7 +1442,14 @@ function renderModal() {
         <label for="f-lrole">Role<select id="f-lrole" name="f-lrole"><option value="viewer">Viewer: sees all, takes orders</option><option value="admin">Admin: full control</option></select></label>
         <p class="live w" id="loginmsg" style="grid-column:1/-1"></p>
         <div class="acts w"><button class="primary" type="submit" style="flex:none">Create login</button></div></form>` : ""}
-      ${isAdmin() ? `<h3 style="font-size:18px;margin-top:18px">Email</h3>
+      ${isAdmin() ? `<h3 style="font-size:18px;margin-top:18px">Regular customers</h3>
+      <p class="hint">Saved regulars show up as suggestions when a name is typed at the counter, so their spending adds up under one name.</p>
+      ${Object.values(S.custs || {}).sort((a, b) => a.name.localeCompare(b.name)).map(c => `<div class="selrow"><span>★ ${esc(c.name)} <small>${esc(c.phone || "")}</small></span><button class="danger" data-a="cust-del" data-id="${c.id}">Remove</button></div>`).join("") || `<p class="hint">No regulars saved yet.</p>`}
+      <form data-f="addcust" class="f" style="margin-top:8px">
+        ${field("f-cname", "Customer name", "", 'required maxlength="30" autocomplete="off"')}
+        ${field("f-cphone", "Phone (optional)", "", 'type="tel" maxlength="20" autocomplete="off"')}
+        <div class="acts w" style="margin-top:0"><button class="ghost" type="submit">Save regular</button></div></form>
+      <h3 style="font-size:18px;margin-top:18px">Email</h3>
       <p class="hint">${S.settings.email ? "Reports go to <b>" + esc(S.settings.email) + "</b>. " : "Set the bar email above. "}${ui.mailer ? "Automatic email is on: the day closing report is sent by itself." : "Automatic email isn't set up yet, so the Email buttons open this device's email app with the report filled in."}</p>
       <h3 style="font-size:18px;margin-top:18px">Cloud backups</h3>
       <p class="hint">A full backup is saved every time the day is closed. Backups can't be changed or deleted.</p>
@@ -1395,7 +1484,7 @@ document.addEventListener("click", e => {
   const el = e.target.closest("[data-a]"); if (!el) return;
   const a = el.dataset.a, id = el.dataset.id, m = ui.modal;
   if (a === "veil") { if (e.target === el) modal(null); return; }
-  if (["item-new", "item-edit", "item-del", "restock", "void", "void-yes", "reopen", "bill-void", "mock-add", "mock-del", "member-del"].includes(a) && !isAdmin()) { toast(ADMIN_ONLY); return; }
+  if (["item-new", "item-edit", "item-del", "restock", "void", "void-yes", "reopen", "bill-void", "mock-add", "mock-del", "member-del", "cust-del"].includes(a) && !isAdmin()) { toast(ADMIN_ONLY); return; }
   switch (a) {
     case "nav": ui.view = el.dataset.v; try { localStorage.setItem("bar-view", ui.view); } catch (_) {} $("#main").scrollTop = 0; if (ui.view === "history") { ui.hist = null; loadHistory(); } if (ui.view === "reports") ui.rep = null; break;
     case "tab": ui.tab = id; $("#main").scrollTop = 0; break;
@@ -1460,6 +1549,12 @@ document.addEventListener("click", e => {
     case "hprint": printDoc(historyHTML(), "change history"); return;
     case "mail-closing": { const c = S.days[m.day].close; openMailApp(`${S.settings.name}: day closing ${m.day}`, closingText(m.day, c), "Day closing " + m.day); return; }
     case "print-closing": printText(closingText(m.day, S.days[m.day].close)); logEvent("print", {what: "Day closing " + m.day}); return;
+    case "cust-del": {
+      const c = S.custs[id]; if (!c || !window.confirm("Remove " + c.name + " from regulars? Their past spending stays in the reports.")) return;
+      delete S.custs[id]; scheduleCommit(); renderModal(); return;
+    }
+    case "cshow": { const r = (ui.cust && ui.cust.rows || []).find(x => x.key === id); if (r) openCustomer(r); return; }
+    case "cregs": ui.custRegs = !ui.custRegs; break;
     case "member-pass": {
       const x = (ui.members || []).find(z => z.user_id === id); if (!x) return;
       const pw = window.prompt("New password for " + x.email + " (at least 8 characters). Tell them the new password; they will be signed out everywhere.");
@@ -1548,6 +1643,16 @@ document.addEventListener("submit", e => {
     });
     return;
   }
+  if (kind === "addcust") {
+    if (!isAdmin()) { toast(ADMIN_ONLY); return; }
+    const name = tidy(v("f-cname")); if (!name) return;
+    if (findRegular(name)) { toast(name + " is already a regular."); return; }
+    const id = uid(); S.custs[id] = {id, name, phone: v("f-cphone")};
+    /* Open customers with the same name now count as this regular. */
+    for (const t of Object.values(S.tabs.tabs)) if (!t.cid && tidy(t.name).toLowerCase() === name.toLowerCase()) t.cid = id;
+    scheduleCommit(); renderModal(); toast(name + " saved as a regular");
+    return;
+  }
   if (kind === "addlogin") {
     const msg = $("#loginmsg"), btn = f.querySelector("button");
     if (!isAdmin()) { msg.textContent = ADMIN_ONLY; return; }
@@ -1563,13 +1668,14 @@ document.addEventListener("submit", e => {
   if (kind === "item") {
     const p = Math.max(1, parseInt(v("f-pours"), 10) || 1), ucost = toSen(v("f-ucost"));
     const d = {name: v("f-name"), cat: v("f-cat") || "Other", price: toSen(v("f-price")), hh: toSen(v("f-hh")), dbl: toSen(v("f-dbl")), pours: p, ucost, cost: Math.round(ucost / p),
-      stock: Math.round((parseFloat(v("f-stock")) || 0) * p), low: Math.round((parseFloat(v("f-low")) || 0) * p), fav: on("f-fav")};
+      stock: Math.round((parseFloat(v("f-stock")) || 0) * p), low: Math.round((parseFloat(v("f-low")) || 0) * p), fav: on("f-fav"), nostock: on("f-nostock")};
+    if (d.nostock) { d.stock = m.id ? (item(m.id).stock || 0) : 0; d.low = 0; }
     if (m.id) Object.assign(item(m.id), d); else S.menu.items.push({id: uid(), ...d});
     saveMenu();
   } else if (kind === "restock") {
     const it = item(m.id); it.stock = (it.stock || 0) + Math.round((parseFloat(v("f-qty")) || 0) * pours(it)); saveMenu(); toast(it.name + ": " + fmtStock(it) + " in stock");
   } else if (kind === "tabname") {
-    if (m && m.rename && curTab()) { curTab().name = v("f-tab"); saveTabs(); } else { newTab(v("f-tab")); f.reset(); }
+    if (m && m.rename && curTab()) { const t = curTab(), reg = findRegular(v("f-tab")); t.name = reg ? reg.name : tidy(v("f-tab")); if (reg) t.cid = reg.id; else delete t.cid; saveTabs(); } else { newTab(v("f-tab")); f.reset(); }
   } else if (kind === "close") {
     const id = dayId(), day = S.days[id] || (S.days[id] = {bills: []});
     const fl = toSen(v("f-float")), counted = toSen(v("f-counted")), cash = summarise(day.bills).pay.cash;

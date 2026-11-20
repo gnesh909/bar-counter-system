@@ -1,5 +1,5 @@
 /* Lets the app open with no internet. Bump VERSION whenever index.html changes. */
-const VERSION = "bcs-v5";
+const VERSION = "bcs-v6";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 /* Only the app itself, its fonts and the sync library are kept for offline use; data requests always go to the network. */
 const CACHE_HOSTS = /^(fonts\.googleapis\.com|fonts\.gstatic\.com|cdn\.jsdelivr\.net)$/;

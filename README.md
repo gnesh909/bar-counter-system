@@ -43,6 +43,16 @@ Menu, stock, open customers and sales are stored in a private Supabase database 
 
 Reports → **Day / Week / Month / Year**, with ‹ › to move between periods. Each shows takings, gross profit, margin, bills, voids, payment methods and best sellers; Year adds a month-by-month table. Reports read all sales on the server, so past years are always available. **Print / PDF** opens Android's print screen (choose *Save as PDF* to keep a file); **Email** sends the report to the bar email.
 
+## Customer spending
+
+Reports → any Day / Week / Month / Year → **Customer spending**: visits, bills, total spent, average bill, last visit and favourite items per customer, top spender first. Tap a customer for their bills. Bills are grouped by the customer name typed at the counter (capitals and extra spaces ignored).
+
+**Regular customers** (Setup → Regular customers, admin): saved regulars appear as suggestions when a name is typed at the counter, so their spending always adds up under one name. They're marked ★, and **Showing regulars only** filters the report to them.
+
+## Services without stock (pool table)
+
+Stock → Add item → tick **Don't track stock** for things like a pool game, karaoke or corkage. These sell like any item but have no stock count, never show as Out or Low, and are left out of restocking and stock value.
+
 ## Closing the day
 
 Reports → Day → **Close the day**. After saving, the app:
