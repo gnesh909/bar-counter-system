@@ -1,20 +1,22 @@
 # Bar Counter System
 
-An all-in-one counter app for a bar: customer tabs, orders, stock and sales reports. It runs in Chrome on an Android tablet and installs like a normal app.
+An all-in-one counter app for a bar: customer tabs, orders, stock and sales reports. It runs in Chrome on Android tablets and phones, installs like a normal app, and keeps every device in sync.
 
 ## Install on the tablet
 
 1. Open the app's GitHub Pages address in **Chrome** on the tablet.
 2. Tap the **⋮** menu, then **Add to Home screen** (or **Install app**).
-3. Open it from the home screen icon. After the first visit it works without internet.
+3. Open it from the home screen icon and sign in with the bar account. The first time, tap **Create bar account**; on every other device, sign in with the same email and password.
 
 ## Where the data lives
 
-Everything (menu, stock, open customers, sales) is saved **on the tablet only**, inside Chrome's storage for this app. Nothing is sent anywhere.
+Menu, stock, open customers and sales are stored in a private Supabase database (Singapore) and copied onto each signed-in device.
 
-- **Back up weekly:** Setup → **Download backup**. Keep the file somewhere off the tablet (Google Drive, email, WhatsApp to yourself).
-- **Restore:** Setup → **Restore from backup** and pick the file. This replaces what's on the device.
-- Clearing Chrome's site data, or uninstalling Chrome, deletes the app's data. Restore from a backup if that happens.
+- **Sync:** changes show up on the other devices within a second or two. Stock counts add up correctly even when two devices sell the same item at once.
+- **Offline:** the app keeps working without internet. Changes wait on the device (the top bar shows "Offline · N waiting") and are sent when the connection returns.
+- **Privacy:** only someone signed in with the bar account can read or change the data.
+- **Backup:** Setup → **Download backup** saves a file of the last 62 days. **Restore from backup** replaces the shared data on every device.
+- Supabase's free plan pauses a project after a week with no use at all. Daily use keeps it awake; if it ever pauses, it can be resumed from the Supabase dashboard.
 
 ## Printing
 
@@ -38,5 +40,7 @@ Everything (menu, stock, open customers, sales) is saved **on the tablet only**,
 | `manifest.webmanifest` | Name and icons for installing |
 | `sw.js` | Offline support |
 | `icon-192.png`, `icon-512.png` | App icons |
+
+The database has one table, `bar_docs`, with row-level security, plus the functions `bar_put` and `bar_put_many`.
 
 To update the app, change `index.html` and raise `VERSION` in `sw.js` so tablets pick up the new copy.
