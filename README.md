@@ -32,6 +32,13 @@ Menu, stock, open customers and sales are stored in a private Supabase database 
 - **Backup:** Setup → **Download backup** saves a file of the last 62 days. **Restore from backup** replaces the shared data on every device.
 - Supabase's free plan pauses a project after a week with no use at all. Daily use keeps it awake; if it ever pauses, it can be resumed from the Supabase dashboard.
 
+## Passwords
+
+- **Forgot password:** the admin goes to Setup → Logins → **Reset password** next to that login and sets a new one. The old password stops working and that login is signed out on every device.
+- **Change my password:** Setup → Account and sync, for any signed-in login.
+- **Forgot password?** on the sign-in screen emails a reset link. This needs the email service (Resend) connected to Supabase's sign-in emails; until then, use the admin reset.
+- Keep a second admin login (or note the admin password somewhere safe) so the bar is never locked out.
+
 ## Reports
 
 Reports → **Day / Week / Month / Year**, with ‹ › to move between periods. Each shows takings, gross profit, margin, bills, voids, payment methods and best sellers; Year adds a month-by-month table. Reports read all sales on the server, so past years are always available. **Print / PDF** opens Android's print screen (choose *Save as PDF* to keep a file); **Email** sends the report to the bar email.
@@ -45,7 +52,7 @@ Reports → Day → **Close the day**. After saving, the app:
 
 ## Change history
 
-Every change is recorded with the login email and time: menu, prices, stock, customers, bills, voids, closings, settings, logins, backups, printed and emailed reports, and anything the server refused. Only admins can read it (History tab), and nobody, including the admin, can edit or delete it.
+Every change is recorded with the login email and time, including every sign-in and sign-out (with the device) and password changes and resets. Filter **Sign-ins and passwords** shows just those. Also recorded: menu, prices, stock, customers, bills, voids, closings, settings, logins, backups, printed and emailed reports, and anything the server refused. Only admins can read it (History tab), and nobody, including the admin, can edit or delete it.
 
 ## Printing
 

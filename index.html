@@ -483,10 +483,15 @@ async function connect() {
 /* If live updates are not connected, check for other devices' changes every 20 seconds. */
 let live = false, retryT = null;
 setInterval(() => { if (sb && user && !live && !inflight && document.visibilityState === "visible") fullLoad().then(() => { online = true; render(); flush(); }, () => { online = false; setSync(); }); }, 20000);
+const deviceName = () => { const u = navigator.userAgent; const os = /Android/.test(u) ? "Android" : /iPhone|iPad/.test(u) ? "iPhone/iPad" : /Windows/.test(u) ? "Windows" : /Mac/.test(u) ? "Mac" : "Other";
+  const app = window.matchMedia && window.matchMedia("(display-mode: standalone)").matches; return os + (app ? " app" : " browser"); };
 async function signIn(email, password, create) {
   const {data, error} = await (create ? sb.auth.signUp({email, password}) : sb.auth.signInWithPassword({email, password}));
   if (error) throw error;
   if (!data.session) throw new Error("Account created. Sign in now.");
+  await finishAuth(data, create, "login");
+}
+async function finishAuth(data, create, how) {
   let me = await sb.rpc("bar_me"); if (me.error) throw me.error;
   let row = me.data && me.data[0];
   if (!row && create) {
@@ -498,6 +503,7 @@ async function signIn(email, password, create) {
   if (user && (user.id !== data.user.id || user.bar !== row.bar_id)) { docs = {}; queue = []; }
   user = {id: data.user.id, email: data.user.email, bar: row.bar_id, role: row.role};
   lsSet("user", user); lsSet("docs", docs); lsSet("queue", queue);
+  logEvent("login", {device: DEV, on: deviceName(), how});
   fromDocs(); ui.ready = true; await connect(); render();
 }
 async function dropLocal() {
@@ -508,6 +514,7 @@ async function dropLocal() {
 }
 async function signOut() {
   if (queue.length && !window.confirm(queue.length + " changes have not reached the server yet and will be lost. Sign out anyway?")) return;
+  try { await sb.rpc("bar_log_event", {p_bar: user.bar, p_action: "logout", p_info: {device: DEV, on: deviceName()}}); } catch (_) {}
   await dropLocal();
 }
 /* ---------- logins (admin) ---------- */
@@ -1014,6 +1021,7 @@ async function loadHistory(more) {
   h.loading = true;
   let q = sb.from("bar_audit").select("id,at,email,action,path,before,after").eq("bar_id", user.bar).order("id", {ascending: false}).limit(100);
   if (h.email) q = q.eq("email", h.email);
+  if (h.type === "logins") q = q.in("action", ["login", "logout", "password_change", "password_reset", "login_add", "login_remove"]);
   if (more && h.rows.length) q = q.lt("id", h.rows[h.rows.length - 1].id);
   const {data, error} = await q;
   h.loading = false;
@@ -1038,6 +1046,10 @@ function describe(h) {
     case "backup": return `Cloud backup saved: ${a.file}`;
     case "email": return `Emailed ${a.what || "a report"}${a.to ? " to " + a.to : ""}${a.via ? " (" + a.via + ")" : ""}`;
     case "print": return `Printed ${a.what || "a report"}`;
+    case "login": return `Signed in on ${a.on || "a device"}${a.device ? " (device " + a.device + ")" : ""}${a.how && a.how !== "login" ? " via " + a.how : ""}`;
+    case "logout": return `Signed out on ${a.on || "a device"}${a.device ? " (device " + a.device + ")" : ""}`;
+    case "password_change": return `Changed own password${a.via ? " (" + a.via + ")" : ""}`;
+    case "password_reset": return `Reset the password of ${a.email}`;
   }
   const diff = keys => keys.filter(k => JSON.stringify(b[k]) !== JSON.stringify(a[k])).map(k => `${LBL[k] || k} ${fmtVal(k, b[k])} → ${fmtVal(k, a[k])}`);
   if (p.startsWith("item/")) {
@@ -1073,6 +1085,7 @@ function viewHistory() {
   const emails = [...new Set(h.rows.map(r => r.email).filter(Boolean).concat(h.email ? [h.email] : []))];
   return `<div class="bar"><h2>Change history</h2>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><select id="f-hemail" aria-label="Filter by login" style="background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px;color:var(--ink)"><option value="">All logins</option>${emails.map(e => `<option ${e === h.email ? "selected" : ""}>${esc(e)}</option>`).join("")}</select>
+    <select id="f-htype" aria-label="Filter by kind" style="background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px;color:var(--ink)"><option value="">All changes</option><option value="logins" ${h.type === "logins" ? "selected" : ""}>Sign-ins and passwords</option></select>
     <button class="ghost" data-a="hrefresh">Refresh</button><button class="ghost" data-a="hprint">Print / PDF</button></div></div>
   <p class="hint">Every change is recorded with the login that made it. This record can't be edited or deleted, even by the admin. Tap a line to see the before and after values.</p>
   ${h.error ? `<p class="warnbox">${esc(h.error)}</p>` : ""}
@@ -1100,7 +1113,8 @@ function viewSignIn() {
       <p class="live w" id="authmsg" style="grid-column:1/-1;color:var(--warn)">${can ? "" : "Can't reach the sign-in service. Check the internet connection, then reload."}</p>
       <div class="acts w">${first ? `<button class="primary" type="submit" data-create="1" ${can ? "" : "disabled"}>Create admin login</button>` : `<button class="primary" type="submit" ${can ? "" : "disabled"}>Sign in</button>`}</div>
     </div>
-    <p class="hint" style="margin:12px 0 0">${first ? "Pick an email and a password of at least 8 characters. Use the same details to sign in as admin on any device." : "No login yet? Ask the admin to create one under Setup → Logins."}</p>
+    ${first ? "" : `<div class="acts" style="margin-top:4px"><button class="ghost" type="button" data-a="forgot" ${can ? "" : "disabled"}>Forgot password?</button></div>`}
+    <p class="hint" style="margin:12px 0 0">${first ? "Pick an email and a password of at least 8 characters. Use the same details to sign in as admin on any device." : "No login yet, or forgot your password? The admin can create logins and reset passwords under Setup → Logins."}</p>
   </form>`;
 }
 function render() {
@@ -1298,6 +1312,12 @@ function renderModal() {
         ${field("f-counted", "Cash counted in drawer (RM)", c.counted != null ? (c.counted / 100).toFixed(2) : "", "required " + dec)}
         <p id="diff" class="live w" style="grid-column:1/-1"></p>
         <div class="acts w"><button class="primary" type="submit">Save closing</button><button class="ghost" type="submit" data-print="1">Save and print</button><button class="ghost" type="button" data-a="close">Cancel</button></div></form>`;
+  } else if (m.kind === "newpass") {
+    h = `<h2>Choose a new password</h2><form data-f="newpass" class="f">
+      ${field("f-rp1", "New password (at least 8 characters)", "", 'type="password" minlength="8" required autofocus autocomplete="new-password"', true)}
+      ${field("f-rp2", "Type it again", "", 'type="password" minlength="8" required autocomplete="new-password"', true)}
+      <p class="live w" id="newpassmsg" style="grid-column:1/-1"></p>
+      <div class="acts w"><button class="primary" type="submit">Save and sign in</button></div></form>`;
   } else if (m.kind === "closed") {
     const c = (S.days[m.day] || {}).close; if (!c) { ui.modal = null; box.innerHTML = ""; return; }
     const bk = {saving: "Saving a backup to the cloud…", ok: "✓ Backup saved to the cloud.", later: "Backup will be saved to the cloud as soon as the app is back online."}[m.backup] || "";
@@ -1327,9 +1347,13 @@ function renderModal() {
         <div class="acts"><button class="ghost" data-a="close">Close</button></div>`}
       <h3 style="font-size:18px;margin-top:18px">Account and sync</h3>
       <p class="hint">Signed in as <b>${esc(user ? user.email : "")}</b> on device ${esc(DEV)}. ${online ? (queue.length ? queue.length + " changes are being sent." : "Everything is synced.") : "Offline now" + (queue.length ? ": " + queue.length + " changes will be sent when the connection returns." : ".")}</p>
-      <div class="acts"><button class="ghost" data-a="signout">Sign out of this device</button></div>
+      <form data-f="mypass" class="f" style="margin-top:8px">
+        ${field("f-np1", "New password for my login", "", 'type="password" minlength="8" required autocomplete="new-password"')}
+        ${field("f-np2", "Type it again", "", 'type="password" minlength="8" required autocomplete="new-password"')}
+        <p class="live w" id="mypassmsg" style="grid-column:1/-1;margin:0"></p>
+        <div class="acts w" style="margin-top:0"><button class="ghost" type="submit">Change my password</button><button class="ghost" type="button" data-a="signout">Sign out of this device</button></div></form>
       ${isAdmin() ? `<h3 style="font-size:18px;margin-top:18px">Logins</h3>
-      ${ui.members == null ? `<p class="hint">Loading logins…</p>` : ui.members.map(x => `<div class="selrow"><span>${esc(x.email || "")} <small>${x.role === "admin" ? "Admin" : "Viewer"}${x.user_id === user.id ? " · you" : ""}</small></span>${x.user_id === user.id ? "" : `<button class="danger" data-a="member-del" data-id="${x.user_id}">Remove</button>`}</div>`).join("")}
+      ${ui.members == null ? `<p class="hint">Loading logins…</p>` : ui.members.map(x => `<div class="selrow"><span>${esc(x.email || "")} <small>${x.role === "admin" ? "Admin" : "Viewer"}${x.user_id === user.id ? " · you" : ""}</small></span>${x.user_id === user.id ? "" : `<span style="display:flex;gap:6px"><button class="ghost" data-a="member-pass" data-id="${x.user_id}">Reset password</button><button class="danger" data-a="member-del" data-id="${x.user_id}">Remove</button></span>`}</div>`).join("")}
       <form data-f="addlogin" class="f" style="margin-top:10px">
         ${field("f-lemail", "New login email", "", 'type="email" required autocomplete="off"', true)}
         ${field("f-lpass", "Password (at least 8 characters)", "", 'type="text" required minlength="8" autocomplete="off"')}
@@ -1436,6 +1460,25 @@ document.addEventListener("click", e => {
     case "hprint": printDoc(historyHTML(), "change history"); return;
     case "mail-closing": { const c = S.days[m.day].close; openMailApp(`${S.settings.name}: day closing ${m.day}`, closingText(m.day, c), "Day closing " + m.day); return; }
     case "print-closing": printText(closingText(m.day, S.days[m.day].close)); logEvent("print", {what: "Day closing " + m.day}); return;
+    case "member-pass": {
+      const x = (ui.members || []).find(z => z.user_id === id); if (!x) return;
+      const pw = window.prompt("New password for " + x.email + " (at least 8 characters). Tell them the new password; they will be signed out everywhere.");
+      if (pw == null) return;
+      if (pw.length < 8) { toast("The password must be at least 8 characters."); return; }
+      sb.rpc("bar_reset_password", {p_bar: user.bar, p_user: id, p_pass: pw}).then(r => toast(r.error ? r.error.message : "Password changed for " + x.email));
+      return;
+    }
+    case "forgot": {
+      const em = (($("#f-email") || {}).value || "").trim(), msg = $("#authmsg");
+      if (!em) { msg.textContent = "Type your email above first, then tap Forgot password."; return; }
+      msg.textContent = "Sending…";
+      sb.auth.resetPasswordForEmail(em, {redirectTo: location.origin + location.pathname}).then(r => {
+        msg.textContent = r.error && !/rate|limit/i.test(r.error.message) ? "The reset email could not be sent. Ask your admin to reset your password under Setup → Logins."
+          : r.error ? "Too many requests. Wait a few minutes, or ask your admin to reset your password."
+          : "If " + em + " is a login of this bar, a reset link is on its way. If nothing arrives within a few minutes, ask your admin to reset your password under Setup → Logins.";
+      });
+      return;
+    }
     case "member-del": {
       const x = (ui.members || []).find(z => z.user_id === id);
       if (!x || !window.confirm("Remove the login " + x.email + "? It will be signed out of the bar on every device.")) return;
@@ -1452,7 +1495,8 @@ document.addEventListener("click", e => {
 });
 document.addEventListener("input", e => {
   const id = e.target.id, m = ui.modal, t = curTab();
-  if (id === "f-hemail") { ui.hist = {rows: [], done: false, email: e.target.value}; loadHistory(); return; }
+  if (id === "f-hemail") { ui.hist = {rows: [], done: false, email: e.target.value, type: (ui.hist || {}).type || ""}; loadHistory(); return; }
+  if (id === "f-htype") { ui.hist = {rows: [], done: false, email: (ui.hist || {}).email || "", type: e.target.value}; loadHistory(); return; }
   if (id === "f-q") { ui.q = e.target.value; const c = $("#custs"); if (c) c.innerHTML = custCards(); }
   else if (id === "f-target" && m) m.target = e.target.value;
   else if (id === "f-newname" && m) m.newname = e.target.value;
@@ -1485,6 +1529,22 @@ document.addEventListener("submit", e => {
       msg.textContent = /Invalid login/i.test(t) ? "Wrong email or password." : /already registered/i.test(t) ? "That email already has a login. Use Sign in." : t === "NOACCESS" ? "This login hasn't been given access yet. Ask the admin to add it under Setup → Logins." : /bar already exists/i.test(t) ? "The bar is already set up. Sign in with your login instead." : /fetch|network/i.test(t) ? "No internet connection. Connect, then try again." : t;
       if (/bar already exists/i.test(t)) { ui.barExists = true; setTimeout(render, 1500); }
       btns.forEach(b => b.disabled = false);
+    });
+    return;
+  }
+  if (kind === "mypass" || kind === "newpass") {
+    const a1 = f.elements[kind === "mypass" ? "f-np1" : "f-rp1"].value, a2 = f.elements[kind === "mypass" ? "f-np2" : "f-rp2"].value;
+    const msg = $(kind === "mypass" ? "#mypassmsg" : "#newpassmsg");
+    if (a1 !== a2) { msg.textContent = "The two passwords don't match."; return; }
+    msg.textContent = "Saving…";
+    sb.auth.updateUser({password: a1}).then(async r => {
+      if (r.error) { msg.textContent = /same|different/i.test(r.error.message) ? "Pick a password different from the old one." : r.error.message; return; }
+      if (kind === "mypass") { logEvent("password_change", {device: DEV}); msg.textContent = "✓ Password changed. Use it next time you sign in."; f.reset(); return; }
+      logEvent("password_change", {device: DEV, via: "reset link"});
+      const {data} = await sb.auth.getSession();
+      modal(null);
+      try { await finishAuth({user: data.session.user, session: data.session}, false, "reset link"); toast("Password changed. You're signed in."); }
+      catch (e) { ui.barExists = true; render(); toast(String(e.message) === "NOACCESS" ? "Password changed, but this login has no access to the bar. Ask the admin." : "Password changed. Sign in with it now."); }
     });
     return;
   }
@@ -1552,7 +1612,11 @@ async function start() {
     else if (navigator.onLine) { note("Please sign in again to keep syncing. Nothing on this device has been lost."); user = null; lsSet("user", null); render(); }
     else note("Working offline. Changes are kept on this device and sent once the app can connect.");
   }
-  sb.auth.onAuthStateChange((ev, session) => { if (ev === "TOKEN_REFRESHED" && session) flush(); });
+  sb.auth.onAuthStateChange((ev, session) => {
+    if (ev === "TOKEN_REFRESHED" && session) flush();
+    /* Opened from a "reset your password" email: ask for the new password. */
+    if (ev === "PASSWORD_RECOVERY") setTimeout(() => modal("newpass", {}), 0);
+  });
   window.addEventListener("online", () => { if (user) connect(); });
   window.addEventListener("offline", () => { online = false; setSync(); });
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && user && sb) connect(); });
