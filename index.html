@@ -191,11 +191,16 @@ tr.warn td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
   nav button{flex:1}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
-#printarea{display:none}
+#printarea,#printdoc{display:none}
 @media print{
   @page{margin:4mm}
   html,body{height:auto;background:#fff!important;color:#000!important;display:block}
-  body>*:not(#printarea){display:none!important}
+  body:not(.pdoc)>*:not(#printarea){display:none!important}
+  body.pdoc>*:not(#printdoc){display:none!important}
+  body.pdoc #printdoc{display:block;font:11pt/1.4 system-ui,sans-serif;color:#000}
+  #printdoc h1{font-size:18pt;margin:0 0 2pt}#printdoc h2{font-size:13pt;margin:14pt 0 4pt}
+  #printdoc table{border-collapse:collapse;width:100%;font-size:10pt}#printdoc th,#printdoc td{border-bottom:1px solid #bbb;padding:3pt 5pt;text-align:left}
+  #printdoc .r{text-align:right}#printdoc .muted{color:#555}
   #printarea{display:block;margin:0;font:12px/1.45 "DM Mono",ui-monospace,Menlo,Consolas,monospace;white-space:pre;color:#000}
 }
 </style>
@@ -207,6 +212,7 @@ tr.warn td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
     <button data-a="nav" data-v="orders">Customers</button>
     <button data-a="nav" data-v="stock">Stock</button>
     <button data-a="nav" data-v="reports">Reports</button>
+    <button data-a="nav" data-v="history" hidden>History</button>
   </nav>
   <span class="sync" id="sync"><i></i><span>Connecting</span></span>
   <button class="ghost" data-a="settings">Setup</button>
@@ -216,6 +222,7 @@ tr.warn td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 <div id="modal"></div>
 <div id="toast" class="toast" hidden role="status"></div>
 <pre id="printarea" aria-hidden="true"></pre>
+<div id="printdoc" aria-hidden="true"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.119.2/dist/umd/supabase.js"></script>
 <script>
@@ -270,9 +277,9 @@ function hhOn(set, now) {
 /*END*/
 
 /* ---------- state ---------- */
-const DEF = {name: "My Bar", svc: 10, tax: 6, round5: true, cut: 5, hh: {on: false, from: "17:00", to: "20:00", days: [0, 1, 2, 3, 4, 5, 6]}};
+const DEF = {name: "My Bar", email: "", svc: 10, tax: 6, round5: true, cut: 5, hh: {on: false, from: "17:00", to: "20:00", days: [0, 1, 2, 3, 4, 5, 6]}};
 const S = {menu: {items: []}, tabs: {tabs: {}}, settings: clone(DEF), days: {}};
-const ui = {view: "orders", tab: null, cat: "All", range: 1, modal: null, ready: false, q: "", sort: "arrival"};
+const ui = {view: "orders", rmode: "day", ranchor: null, rep: null, hist: null, backups: null, mailer: false, tab: null, cat: "All", range: 1, modal: null, ready: false, q: "", sort: "arrival"};
 /* Data is shared through Supabase. Each device also keeps a copy in localStorage ("bcs:" keys),
    so it opens and takes orders with no internet; queued changes are sent when the connection returns. */
 const KEY = "bcs:";
@@ -330,11 +337,12 @@ function toDocs() {
   }
   return d;
 }
-function fromDocs() {
+function fromDocs() { Object.assign(S, docsToState(docs)); }
+function docsToState(src) {
   const items = [], tabs = {}, days = {};
   const dayOf = id => days[id] || (days[id] = {bills: []});
-  for (const p in docs) {
-    const v = docs[p];
+  for (const p in src) {
+    const v = src[p];
     if (p.startsWith("item/")) items.push(clone(v));
     else if (p.startsWith("tab/")) tabs[v.id] = clone(v);
     else if (p.startsWith("bill/")) dayOf(p.split("/")[1]).bills.push(clone(v));
@@ -342,8 +350,7 @@ function fromDocs() {
   }
   items.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   for (const id in days) days[id].bills.sort((a, b) => a.t - b.t);
-  S.settings = {...clone(DEF), ...clone(docs.settings || {})};
-  S.menu = {items}; S.tabs = {tabs}; S.days = days;
+  return {settings: {...clone(DEF), ...clone(src.settings || {})}, menu: {items}, tabs: {tabs}, days};
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function commit() {
@@ -361,6 +368,7 @@ function commit() {
     const op = {path: p, data: b, delta: null};
     if (p.startsWith("item/")) { if (a) op.delta = (b.stock || 0) - (a.stock || 0); else op.isNew = true; }
     push(op); docs[p] = b;
+    if (p.startsWith("bill/") || p.startsWith("close/")) billsAt = Date.now();
   }
   for (const p in docs) if (!(p in next)) { push({path: p, data: docs[p], del: true, delta: null}); delete docs[p]; }
   lsSet("docs", docs); lsSet("queue", queue);
@@ -377,6 +385,7 @@ async function flush() {
     const {data: skipped, error} = await sb.rpc("bar_put_many", {p_bar: user.bar, p_ops: batch});
     if (error) throw error;
     queue.splice(0, inflight); inflight = 0; online = true; lsSet("queue", queue);
+    if (batch.some(o => o.path.startsWith("bill/") || o.path.startsWith("close/"))) billsAt = Date.now();
     /* Changes this login isn't allowed to make are refused by the server: put back the real values. */
     if (skipped && skipped.length) toast(ADMIN_ONLY + " That change was undone.");
     refreshDocs([...new Set([...(skipped || []), ...batch.filter(o => o.path.startsWith("item/") && !o.del).map(o => o.path)])]).catch(() => {});
@@ -394,6 +403,7 @@ function applyRemote(row) {
   if (!row || !row.path) return;
   if (queue.some(q => q.path === row.path)) return; /* our newer change is on its way */
   if (row.deleted) delete docs[row.path]; else docs[row.path] = row.data;
+  if (row.path.startsWith("bill/") || row.path.startsWith("close/")) billsAt = Date.now();
   lsSet("docs", docs);
   fromDocs(); scheduleRender();
 }
@@ -459,6 +469,8 @@ async function connect() {
     online = true; note("");
     await migrateLegacy(n);
     render(); flush();
+    probeMailer();
+    const pb = lsGet("pendingBackup", null); if (pb) cloudBackup(pb);
     if (channel) sb.removeChannel(channel);
     channel = sb.channel("bar-" + user.id)
       .on("postgres_changes", {event: "*", schema: "public", table: "bar_docs", filter: "bar_id=eq." + user.bar}, p => applyRemote(p.new))
@@ -770,38 +782,313 @@ function viewStock() {
       <td class="r">${isAdmin() ? `<button class="ghost" data-a="restock" data-id="${i.id}">Restock</button> <button class="ghost" data-a="item-edit" data-id="${i.id}">Edit</button>` : ""}</td></tr>`; }).join("")}</tbody></table></div>`
   : `<p class="empty">Nothing here yet. Add your drinks and food, and how much you hold of each.</p>`}`;
 }
+/* ---------- reports ---------- */
+const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const fromYmd = k => { const [y, m, d] = k.split("-").map(Number); return new Date(y, m - 1, d || 1, 12); };
+let billsAt = 0; /* last time a bill or closing changed, so reports know to refresh */
+function period() {
+  const a = ui.ranchor ? new Date(ui.ranchor) : fromYmd(dayId());
+  let f, t, label;
+  const fmt = (d, o) => d.toLocaleDateString("en-MY", o);
+  if (ui.rmode === "week") { f = new Date(a); f.setDate(a.getDate() - (a.getDay() + 6) % 7); t = new Date(f); t.setDate(f.getDate() + 6); label = fmt(f, {day: "numeric", month: "short"}) + " – " + fmt(t, {day: "numeric", month: "short", year: "numeric"}); }
+  else if (ui.rmode === "month") { f = new Date(a.getFullYear(), a.getMonth(), 1, 12); t = new Date(a.getFullYear(), a.getMonth() + 1, 0, 12); label = fmt(f, {month: "long", year: "numeric"}); }
+  else if (ui.rmode === "year") { f = new Date(a.getFullYear(), 0, 1, 12); t = new Date(a.getFullYear(), 11, 31, 12); label = String(a.getFullYear()); }
+  else { f = t = a; label = fmt(a, {weekday: "long", day: "numeric", month: "long", year: "numeric"}); }
+  const keys = [];
+  if (ui.rmode === "year") for (let m = 0; m < 12; m++) keys.push(`${f.getFullYear()}-${pad(m + 1)}`);
+  else for (let d = new Date(f); d <= t; d.setDate(d.getDate() + 1)) keys.push(ymd(d));
+  return {from: ymd(f), to: ymd(t), label, group: ui.rmode === "year" ? "month" : "day", keys, title: {day: "Daily", week: "Weekly", month: "Monthly", year: "Yearly"}[ui.rmode] + " sales report"};
+}
+function shiftPeriod(dir) {
+  const a = ui.ranchor ? new Date(ui.ranchor) : fromYmd(dayId());
+  if (ui.rmode === "day") a.setDate(a.getDate() + dir);
+  else if (ui.rmode === "week") a.setDate(a.getDate() + 7 * dir);
+  else if (ui.rmode === "month") { a.setDate(1); a.setMonth(a.getMonth() + dir); }
+  else a.setFullYear(a.getFullYear() + dir);
+  ui.ranchor = a.getTime(); ui.rep = null;
+}
+/* Same totals as the server report, from the sales kept on this device (used when offline). */
+function localReport(from, to, group) {
+  const rows = {}, items = {};
+  for (const id in S.days) {
+    if (id < from || id > to) continue;
+    for (const b of S.days[id].bills || []) {
+      const k = group === "month" ? id.slice(0, 7) : id;
+      const r = rows[k] || (rows[k] = {k, sales: 0, net: 0, bills: 0, voids: 0, cash: 0, card: 0, ewallet: 0, profit: 0, cogs: 0, units: 0});
+      if (b.void) { r.voids++; continue; }
+      r.sales += b.total; r.net += b.sub || 0; r.bills++; r[b.pay] = (r[b.pay] || 0) + b.total;
+      for (const l of b.lines) {
+        const pr = (l.price - (l.cost || 0)) * l.qty; r.profit += pr; r.cogs += (l.cost || 0) * l.qty; r.units += l.qty;
+        const it = items[l.name] || (items[l.name] = {name: l.name, qty: 0, amt: 0, profit: 0}); it.qty += l.qty; it.amt += l.price * l.qty; it.profit += pr;
+      }
+    }
+  }
+  return {rows: Object.values(rows).sort((x, y) => x.k < y.k ? -1 : 1), items: Object.values(items).sort((x, y) => y.amt - x.amt).slice(0, 15)};
+}
+async function loadReport(P) {
+  const key = ui.rmode + P.from, local = () => ({key, data: localReport(P.from, P.to, P.group), local: true, at: Date.now()});
+  if (!(sb && user && online)) { ui.rep = local(); return; }
+  ui.rep = {...local(), loading: true, local: false};
+  const {data, error} = await sb.rpc("bar_report", {p_bar: user.bar, p_from: P.from, p_to: P.to, p_group: P.group});
+  if (!ui.rep || ui.rep.key !== key) return;
+  ui.rep = error ? local() : {key, data, at: Date.now()};
+  if (ui.view === "reports" && !ui.modal) render();
+}
+function repTotals(rows) {
+  const t = {sales: 0, net: 0, bills: 0, voids: 0, cash: 0, card: 0, ewallet: 0, profit: 0, cogs: 0, units: 0};
+  for (const r of rows) for (const k in t) t[k] += +r[k] || 0;
+  return t;
+}
+const keyLabel = (k, group) => group === "month" ? fromYmd(k).toLocaleDateString("en-MY", {month: "short"}) : fromYmd(k).toLocaleDateString("en-MY", {weekday: "short", day: "numeric", month: "short"});
 function viewReports() {
-  const ids = rangeDays(ui.range), today = dayId();
-  const bills = ids.flatMap(id => ((S.days[id] || {}).bills || []).map(b => ({...b, day: id})));
-  const r = summarise(bills);
-  const top = Object.entries(r.items).sort((a, b) => b[1].amt - a[1].amt).slice(0, 8);
-  const maxTop = top.length ? top[0][1].amt : 1;
-  const chartIds = rangeDays(Math.max(7, ui.range));
-  const daily = chartIds.map(id => summarise((S.days[id] || {}).bills || []).sales);
-  const maxDay = Math.max(1, ...daily), payTotal = Math.max(1, r.sales);
+  const P = period(), key = ui.rmode + P.from, today = dayId();
+  if (!ui.rep || ui.rep.key !== key || (!ui.rep.loading && ui.rep.at < billsAt)) loadReport(P);
+  const R = ui.rep.data, byK = Object.fromEntries(R.rows.map(r => [r.k, r])), T = repTotals(R.rows);
+  const vals = P.keys.map(k => +(byK[k] || {}).sales || 0), maxV = Math.max(1, ...vals);
+  const margin = T.sales ? Math.round(T.profit / T.net * 100) : 0;
+  const payTotal = Math.max(1, T.sales), maxTop = R.items.length ? +R.items[0].amt : 1;
   const lowItems = S.menu.items.filter(i => i.stock <= (i.low || 0));
-  const label = ui.range === 1 ? "today" : "last " + ui.range + " days";
-  const c = (S.days[today] || {}).close;
-  return `<div class="bar"><h2>Sales, ${label}</h2>
-    <div class="seg">${[[1, "Today"], [7, "7 days"], [30, "30 days"]].map(([n, l]) => `<button data-a="range" data-id="${n}" aria-pressed="${ui.range === n}">${l}</button>`).join("")}</div></div>
+  const isDay = ui.rmode === "day", isToday = isDay && P.from === today;
+  const c = isDay ? (S.days[P.from] || {}).close : null;
+  const dayBills = isDay ? ((S.days[P.from] || {}).bills || []).slice().reverse() : [];
+  const rowsTable = P.keys.filter(k => byK[k]).map(k => { const r = byK[k]; return `<tr><td>${keyLabel(k, P.group)}</td><td class="r num">${r.bills}</td><td class="r num">${rm(+r.sales)}</td><td class="r num">${rm(+r.profit)}</td><td class="r num">${r.net ? Math.round(r.profit / r.net * 100) : 0}%</td></tr>`; }).join("");
+  return `<div class="bar"><div class="seg">${[["day", "Day"], ["week", "Week"], ["month", "Month"], ["year", "Year"]].map(([k, l]) => `<button data-a="rmode" data-id="${k}" aria-pressed="${ui.rmode === k}">${l}</button>`).join("")}</div>
+    <div style="display:flex;gap:6px;align-items:center"><button class="ghost" data-a="rprev" aria-label="Earlier">‹</button><button class="ghost" data-a="rnow">Now</button><button class="ghost" data-a="rnext" aria-label="Later">›</button></div>
+    <div style="display:flex;gap:6px"><button class="ghost" data-a="rprint">Print / PDF</button><button class="primary" style="flex:none" data-a="remail">Email</button></div></div>
+  <h2 style="margin:0 0 4px">${esc(P.label)}</h2>
+  <p class="hint">${ui.rep.loading ? "Updating from the server…" : ui.rep.local ? "Offline: showing sales stored on this device (last " + KEEP_DAYS + " days)." : "All sales on record."}</p>
   <div class="tiles">
-    <div class="tile"><span>Takings</span><strong class="num">${rm(r.sales)}</strong></div>
-    <div class="tile"><span>Bills closed</span><strong class="num">${r.count}</strong></div>
-    <div class="tile"><span>Average bill</span><strong class="num">${rm(r.count ? Math.round(r.sales / r.count) : 0)}</strong></div>
-    <div class="tile"><span>Gross profit on items</span><strong class="num">${rm(r.profit)}</strong></div>
+    <div class="tile"><span>Takings</span><strong class="num">${rm(T.sales)}</strong></div>
+    <div class="tile"><span>Gross profit</span><strong class="num">${rm(T.profit)}</strong></div>
+    <div class="tile"><span>Margin on items</span><strong class="num">${margin}%</strong></div>
+    <div class="tile"><span>Bills closed</span><strong class="num">${T.bills}</strong></div>
+    <div class="tile"><span>Average bill</span><strong class="num">${rm(T.bills ? Math.round(T.sales / T.bills) : 0)}</strong></div>
+    <div class="tile"><span>Voided</span><strong class="num">${T.voids}</strong></div>
   </div>
-  <div class="closebar"><span>${c ? `Day closed at ${hhmm(c.t)}. Cash ${c.diff === 0 ? "balanced" : (c.diff < 0 ? "short by " : "over by ") + rm(Math.abs(c.diff))}.` : `Business day ${today} is still open.`}</span>
-    <button class="primary" style="flex:none" data-a="closeday">${c ? "Redo day closing" : "Close the day"}</button></div>
+  ${isDay ? `<div class="closebar"><span>${c ? `Day closed at ${hhmm(c.t)}. Cash ${c.diff === 0 ? "balanced" : (c.diff < 0 ? "short by " : "over by ") + rm(Math.abs(c.diff))}.` : isToday ? `Business day ${today} is still open.` : "This day was not closed."}</span>
+    ${isToday ? `<button class="primary" style="flex:none" data-a="closeday">${c ? "Redo day closing" : "Close the day"}</button>` : ""}</div>` : ""}
   <div class="cols">
-    <div class="card"><h3>Takings by day</h3>
-      <div class="days">${daily.map((v, i) => `<div class="${chartIds[i] === today ? "today" : ""}" style="height:${Math.round(v / maxDay * 100)}%" title="${chartIds[i]}: ${rm(v)}">${chartIds.length <= 7 && v ? `<b>${Math.round(v / 100)}</b>` : ""}</div>`).join("")}</div>
-      <div class="axis"><span>${chartIds[0].slice(5)}</span><span>Best day ${rm(Math.max(0, ...daily))}</span><span>Today</span></div></div>
-    <div class="card"><h3>Best sellers</h3>${top.length ? top.map(([n, v]) => `<div class="rank"><span>${esc(n)} <small style="color:var(--muted)">× ${v.qty}</small></span><span class="num">${rm(v.amt)}</span><i style="width:${Math.round(v.amt / maxTop * 100)}%"></i></div>`).join("") : `<p class="empty">No sales in this period yet.</p>`}</div>
-    <div class="card"><h3>How people paid</h3>${Object.entries(PAY).map(([k, l]) => `<div class="rank"><span>${l}</span><span class="num">${rm(r.pay[k] || 0)}</span><i style="width:${Math.round((r.pay[k] || 0) / payTotal * 100)}%"></i></div>`).join("")}
+    ${isDay ? "" : `<div class="card"><h3>Takings by ${P.group === "month" ? "month" : "day"}</h3>
+      <div class="days">${P.keys.map((k, i) => `<div class="${k === today ? "today" : ""}" style="height:${Math.round(vals[i] / maxV * 100)}%" title="${k}: ${rm(vals[i])}">${P.keys.length <= 12 && vals[i] ? `<b>${Math.round(vals[i] / 100)}</b>` : ""}</div>`).join("")}</div>
+      <div class="axis"><span>${keyLabel(P.keys[0], P.group)}</span><span>Best ${rm(Math.max(0, ...vals))}</span><span>${keyLabel(P.keys[P.keys.length - 1], P.group)}</span></div></div>`}
+    <div class="card"><h3>Best sellers</h3>${R.items.length ? R.items.slice(0, 8).map(v => `<div class="rank"><span>${esc(v.name)} <small style="color:var(--muted)">× ${+v.qty}</small></span><span class="num">${rm(+v.amt)}</span><i style="width:${Math.round(v.amt / maxTop * 100)}%"></i></div>`).join("") : `<p class="empty">No sales in this period.</p>`}</div>
+    <div class="card"><h3>How people paid</h3>${Object.entries(PAY).map(([k, l]) => `<div class="rank"><span>${l}</span><span class="num">${rm(T[k])}</span><i style="width:${Math.round(T[k] / payTotal * 100)}%"></i></div>`).join("")}
       <h3 style="margin-top:16px">Needs restocking</h3>${lowItems.length ? lowItems.map(i => `<div class="tot"><span>${esc(i.name)}</span><span class="pill ${status(i)[0]}">${i.stock <= 0 ? "Out" : fmtStock(i) + " left"}</span></div>`).join("") : `<p style="color:var(--muted);margin:0">Everything is above its low level.</p>`}</div>
-    <div class="card bills"><h3>Bills</h3>${bills.length ? bills.slice().reverse().slice(0, 40).map(b => `<button data-a="bill" data-id="${b.day}|${b.id}" class="${b.void ? "void" : ""}"><span class="num">${b.day === today ? hhmm(b.t) : b.day.slice(5)}</span><span>${esc(b.tab)}</span><span class="num">${rm(b.total)}</span></button>`).join("") : `<p class="empty">No bills in this period yet.</p>`}</div>
+    ${isDay ? `<div class="card bills"><h3>Bills</h3>${dayBills.length ? dayBills.map(b => `<button data-a="bill" data-id="${P.from}|${b.id}" class="${b.void ? "void" : ""}"><span class="num">${hhmm(b.t)}</span><span>${esc(b.tab)}</span><span class="num">${rm(b.total)}</span></button>`).join("") : `<p class="empty">No bills on this device for this day.</p>`}</div>`
+    : `<div class="card" style="grid-column:1/-1"><h3>${P.group === "month" ? "Month by month" : "Day by day"}</h3>${rowsTable ? `<div class="scroll" style="border:0"><table style="min-width:0"><thead><tr><th>${P.group === "month" ? "Month" : "Day"}</th><th class="r">Bills</th><th class="r">Takings</th><th class="r">Profit</th><th class="r">Margin</th></tr></thead><tbody>${rowsTable}
+      <tr><td><b>Total</b></td><td class="r num"><b>${T.bills}</b></td><td class="r num"><b>${rm(T.sales)}</b></td><td class="r num"><b>${rm(T.profit)}</b></td><td class="r num"><b>${margin}%</b></td></tr></tbody></table></div>` : `<p class="empty">No sales in this period.</p>`}</div>`}
   </div>`;
 }
+/* Printable A4 report (also used as the email body). */
+function reportHTML() {
+  const P = period(), R = ui.rep ? ui.rep.data : localReport(P.from, P.to, P.group), byK = Object.fromEntries(R.rows.map(r => [r.k, r])), T = repTotals(R.rows);
+  const td = "border-bottom:1px solid #ccc;padding:4px 6px;text-align:left", tr = td + ";text-align:right";
+  const row = (cells, head) => `<tr>${cells.map((c, i) => `<${head ? "th" : "td"} style="${i ? tr : td}">${c}</${head ? "th" : "td"}>`).join("")}</tr>`;
+  const closing = ui.rmode === "day" && (S.days[P.from] || {}).close;
+  return `<div style="font-family:system-ui,Arial,sans-serif;color:#111;max-width:720px">
+  <h1 style="font-size:20px;margin:0">${esc(S.settings.name)}</h1>
+  <p style="margin:2px 0 12px;color:#555">${P.title} · ${esc(P.label)} · printed ${new Date().toLocaleString("en-MY")}</p>
+  <table style="border-collapse:collapse;width:100%;font-size:14px">
+    ${row(["Takings", rm(T.sales)])}${row(["Net sales (before service charge and SST)", rm(T.net)])}${row(["Cost of items sold", rm(T.cogs)])}
+    ${row(["<b>Gross profit</b>", "<b>" + rm(T.profit) + "</b>"])}${row(["Margin on items", (T.net ? Math.round(T.profit / T.net * 100) : 0) + "%"])}
+    ${row(["Bills closed", T.bills])}${row(["Voided bills", T.voids])}${row(["Cash", rm(T.cash)])}${row(["Card", rm(T.card)])}${row(["E-wallet / QR", rm(T.ewallet)])}
+    ${closing ? row(["Opening float", rm(closing.float)]) + row(["Cash counted", rm(closing.counted)]) + row([closing.diff < 0 ? "Cash short" : closing.diff > 0 ? "Cash over" : "Cash balanced", rm(Math.abs(closing.diff))]) : ""}
+  </table>
+  ${ui.rmode === "day" ? "" : `<h2 style="font-size:16px;margin:16px 0 6px">${P.group === "month" ? "Month by month" : "Day by day"}</h2>
+  <table style="border-collapse:collapse;width:100%;font-size:13px">${row([P.group === "month" ? "Month" : "Day", "Bills", "Takings", "Profit"], true)}
+    ${P.keys.filter(k => byK[k]).map(k => row([keyLabel(k, P.group), byK[k].bills, rm(+byK[k].sales), rm(+byK[k].profit)])).join("")}
+    ${row(["<b>Total</b>", "<b>" + T.bills + "</b>", "<b>" + rm(T.sales) + "</b>", "<b>" + rm(T.profit) + "</b>"])}</table>`}
+  <h2 style="font-size:16px;margin:16px 0 6px">Best sellers</h2>
+  <table style="border-collapse:collapse;width:100%;font-size:13px">${row(["Item", "Qty", "Sales", "Profit"], true)}${R.items.map(i => row([esc(i.name), +i.qty, rm(+i.amt), rm(+i.profit)])).join("") || row(["No sales", "", "", ""])}</table>
+  </div>`;
+}
+function reportText() {
+  const P = period(), R = ui.rep ? ui.rep.data : localReport(P.from, P.to, P.group), T = repTotals(R.rows), w = 34;
+  const line = (a, b) => a + " ".repeat(Math.max(1, w - a.length - String(b).length)) + b;
+  const out = [S.settings.name.toUpperCase(), P.title, P.label, "-".repeat(w), line("Takings", rm(T.sales)), line("Gross profit", rm(T.profit)), line("Bills closed", T.bills), line("Voided", T.voids),
+    line("Cash", rm(T.cash)), line("Card", rm(T.card)), line("E-wallet / QR", rm(T.ewallet))];
+  if (ui.rmode !== "day") { out.push("-".repeat(w)); for (const r of R.rows) out.push(line(keyLabel(r.k, P.group), rm(+r.sales))); }
+  out.push("-".repeat(w), "Best sellers"); for (const i of R.items.slice(0, 10)) out.push(line(`${+i.qty} x ${i.name}`.slice(0, w - 12), rm(+i.amt)));
+  return out.join("\n");
+}
+function printDoc(html, what) {
+  $("#printdoc").innerHTML = html; document.body.classList.add("pdoc");
+  const done = () => { document.body.classList.remove("pdoc"); window.removeEventListener("afterprint", done); };
+  window.addEventListener("afterprint", done);
+  setTimeout(() => { try { window.print(); } catch (_) { toast("Printing is blocked here."); } setTimeout(done, 1500); }, 60);
+  logEvent("print", {what});
+}
+const logEvent = (action, info) => { if (sb && user) sb.rpc("bar_log_event", {p_bar: user.bar, p_action: action, p_info: info}).then(() => {}, () => {}); };
+
+/* ---------- email ----------
+   With the email service set up, reports are sent automatically from the server.
+   Otherwise the device's email app opens with the report filled in, ready to send. */
+async function probeMailer() {
+  try { const {data, error} = await sb.functions.invoke("send-report", {body: {probe: true, bar: user.bar}}); ui.mailer = !error && !!(data && data.ok); }
+  catch (_) { ui.mailer = false; }
+}
+async function sendAuto(subject, text, html, what) {
+  const {data, error} = await sb.functions.invoke("send-report", {body: {bar: user.bar, subject, text, html}});
+  if (error || !(data && data.ok)) throw new Error((data && data.error) || (error && error.message) || "send failed");
+  logEvent("email", {what, to: S.settings.email});
+}
+function openMailApp(subject, text, what) {
+  const to = S.settings.email || "";
+  const url = "mailto:" + encodeURIComponent(to) + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(text.slice(0, 1800));
+  logEvent("email", {what, to, via: "email app"});
+  location.href = url;
+}
+function emailReport() {
+  const P = period(), subject = `${S.settings.name}: ${P.title} ${P.label}`;
+  if (!S.settings.email) return toast(isAdmin() ? "Add the bar email in Setup first." : "Ask the admin to add the bar email in Setup.");
+  if (ui.mailer) { toast("Sending…"); sendAuto(subject, reportText(), reportHTML(), P.title + " " + P.label).then(() => toast("Report emailed to " + S.settings.email), () => openMailApp(subject, reportText(), P.title + " " + P.label)); }
+  else openMailApp(subject, reportText(), P.title + " " + P.label);
+}
+
+/* ---------- cloud backup on day closing ---------- */
+async function fetchAllDocs() {
+  const out = {};
+  for (let from = 0; ; from += 1000) {
+    const {data, error} = await sb.from("bar_docs").select("path,data,deleted").eq("bar_id", user.bar).range(from, from + 999);
+    if (error) throw error;
+    for (const r of data) if (!r.deleted) out[r.path] = r.data;
+    if (data.length < 1000) break;
+  }
+  return out;
+}
+/* Wait until every queued change has reached the server (or give up after a while). */
+async function syncNow(ms = 15000) {
+  const end = Date.now() + ms;
+  while (queue.length && Date.now() < end) {
+    if (!inflight) await flush();
+    if (queue.length) await new Promise(r => setTimeout(r, 400));
+  }
+  return !queue.length;
+}
+async function cloudBackup(day) {
+  if (!(sb && user)) { lsSet("pendingBackup", day); return "later"; }
+  try {
+    if (!(await syncNow())) throw new Error("unsent changes");
+    const st = docsToState(await fetchAllDocs());
+    const body = JSON.stringify({app: "bar-counter-system", version: 1, saved: new Date().toISOString(), day, by: user.email, menu: st.menu, tabs: st.tabs, settings: st.settings, days: st.days});
+    const file = `${day}_${new Date().toISOString().replace(/[:.]/g, "-")}_${DEV}.json`;
+    const {error} = await sb.storage.from("backups").upload(user.bar + "/" + file, new Blob([body], {type: "application/json"}), {upsert: false, contentType: "application/json"});
+    if (error) throw error;
+    await sb.rpc("bar_log_backup", {p_bar: user.bar, p_file: file, p_bytes: body.length});
+    localStorage.removeItem(KEY + "pendingBackup");
+    return "ok";
+  } catch (e) { ui.backupError = String(e && e.message || e); lsSet("pendingBackup", day); return "later"; }
+}
+async function loadBackups() {
+  const {data, error} = await sb.storage.from("backups").list(user.bar, {limit: 40, sortBy: {column: "name", order: "desc"}});
+  ui.backups = error ? [] : data.filter(f => f.name.endsWith(".json"));
+  if (ui.modal && ui.modal.kind === "settings") renderModal();
+}
+async function openBackup(name) {
+  const {data, error} = await sb.storage.from("backups").createSignedUrl(user.bar + "/" + name, 120, {download: name});
+  if (error) return toast("Could not open that backup.");
+  location.href = data.signedUrl;
+}
+/* Runs after the day closing is saved: cloud backup, then the email. */
+async function afterClose(day) {
+  const m = ui.modal; if (!m || m.kind !== "closed") return;
+  m.backup = "saving"; renderModal();
+  m.backup = await cloudBackup(day); if (ui.modal === m) renderModal();
+  if (S.settings.email && ui.mailer) {
+    m.mail = "sending"; if (ui.modal === m) renderModal();
+    try { await sendAuto(`${S.settings.name}: day closing ${day}`, closingText(day, S.days[day].close), closingHTML(day), "Day closing " + day); m.mail = "sent"; }
+    catch (_) { m.mail = "failed"; }
+    if (ui.modal === m) renderModal();
+  }
+}
+function closingHTML(day) {
+  const keep = [ui.rmode, ui.ranchor, ui.rep];
+  ui.rmode = "day"; ui.ranchor = fromYmd(day).getTime(); ui.rep = {key: "day" + day, data: localReport(day, day, "day")};
+  const h = reportHTML(); [ui.rmode, ui.ranchor, ui.rep] = keep; return h;
+}
+
+/* ---------- change history (admin) ---------- */
+async function loadHistory(more) {
+  if (!(sb && user && isAdmin())) return;
+  const h = ui.hist || (ui.hist = {rows: [], done: false, email: ""});
+  h.loading = true;
+  let q = sb.from("bar_audit").select("id,at,email,action,path,before,after").eq("bar_id", user.bar).order("id", {ascending: false}).limit(100);
+  if (h.email) q = q.eq("email", h.email);
+  if (more && h.rows.length) q = q.lt("id", h.rows[h.rows.length - 1].id);
+  const {data, error} = await q;
+  h.loading = false;
+  if (error) { h.error = "Could not load the history. Check the connection."; }
+  else { h.error = ""; h.rows = more ? h.rows.concat(data) : data; h.done = data.length < 100; }
+  if (ui.view === "history" && !ui.modal) render();
+}
+const LBL = {name: "name", cat: "category", price: "price", hh: "happy hour price", dbl: "double price", cost: "cost", ucost: "unit cost", pours: "pours", low: "warn level", stock: "stock", fav: "quick key",
+  email: "bar email", svc: "service charge", tax: "SST", round5: "cash rounding", cut: "day ends at", hh_: "happy hour"};
+function fmtVal(k, v) {
+  if (v == null || v === "") return "—";
+  if (["price", "hh", "dbl", "cost", "ucost"].includes(k)) return rm(+v);
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+function describe(h) {
+  const b = h.before || {}, a = h.after || {}, p = h.path || "", ref = h.action === "refused" ? "Refused (viewer): " : "";
+  switch (h.action) {
+    case "bar_create": return "Set up the bar";
+    case "login_add": return `Created login ${a.email} (${a.role})`;
+    case "login_remove": return `Removed login ${b.email}`;
+    case "backup": return `Cloud backup saved: ${a.file}`;
+    case "email": return `Emailed ${a.what || "a report"}${a.to ? " to " + a.to : ""}${a.via ? " (" + a.via + ")" : ""}`;
+    case "print": return `Printed ${a.what || "a report"}`;
+  }
+  const diff = keys => keys.filter(k => JSON.stringify(b[k]) !== JSON.stringify(a[k])).map(k => `${LBL[k] || k} ${fmtVal(k, b[k])} → ${fmtVal(k, a[k])}`);
+  if (p.startsWith("item/")) {
+    const n = a.name || b.name || "item";
+    if (h.action === "create") return `Added menu item ${n} at ${rm(+a.price || 0)}, stock ${a.stock ?? 0}`;
+    if (h.action === "delete") return `Removed menu item ${n}`;
+    if (h.action === "stock") return `Stock of ${n}: ${b.stock} → ${a.stock}`;
+    return ref + `${n}: ` + (diff(["name", "cat", "price", "hh", "dbl", "cost", "ucost", "pours", "low", "stock", "fav"]).join(", ") || "changed");
+  }
+  if (p.startsWith("tab/")) {
+    const n = a.name || b.name || "customer";
+    if (h.action === "create") return `Opened customer ${n}` + ((a.lines || []).length ? ": " + a.lines.map(l => `${l.q ?? l.qty} ${l.n ?? l.name}`).join(", ") : "");
+    if (h.action === "delete") return `Closed customer ${n}`;
+    const q = ls => Object.fromEntries((ls || []).map(l => [l.n ?? l.name, l.q ?? l.qty]));
+    const qb = q(b.lines), qa = q(a.lines), ch = [];
+    for (const k of new Set([...Object.keys(qb), ...Object.keys(qa)])) { const d = (qa[k] || 0) - (qb[k] || 0); if (d) ch.push((d > 0 ? "+" : "−") + Math.abs(d) + " " + k); }
+    if (a.name && b.name && a.name !== b.name) ch.unshift(`renamed from ${b.name}`);
+    return `${n}: ${ch.join(", ") || "updated"}`;
+  }
+  if (p.startsWith("bill/")) {
+    if (h.action === "create") return `Bill ${a.no || ""} for ${a.tab || ""}: ${rm(+a.total || 0)} by ${PAY[a.pay] || a.pay}`;
+    if (h.action === "delete") return `Deleted bill ${b.no || ""}`;
+    if (a.void && !b.void) return ref + `${a.reopened ? "Reopened" : "Voided"} bill ${a.no || ""} for ${a.tab || ""} (${rm(+a.total || 0)})`;
+    return ref + `Changed bill ${a.no || b.no || ""}`;
+  }
+  if (p.startsWith("close/")) return `Day closing ${p.slice(6)}: counted ${rm(+a.counted || 0)}, ${a.diff === 0 ? "balanced" : a.diff < 0 ? "short " + rm(-a.diff) : "over " + rm(a.diff)}`;
+  if (p === "settings") return ref + "Setup: " + (diff(["name", "email", "svc", "tax", "round5", "cut"]).concat(JSON.stringify(a.hh) !== JSON.stringify(b.hh) ? ["happy hour changed"] : []).join(", ") || "saved");
+  return ref + h.action + " " + p;
+}
+function viewHistory() {
+  const h = ui.hist;
+  if (!h) { loadHistory(); return `<p class="empty">Loading history…</p>`; }
+  const emails = [...new Set(h.rows.map(r => r.email).filter(Boolean).concat(h.email ? [h.email] : []))];
+  return `<div class="bar"><h2>Change history</h2>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><select id="f-hemail" aria-label="Filter by login" style="background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px;color:var(--ink)"><option value="">All logins</option>${emails.map(e => `<option ${e === h.email ? "selected" : ""}>${esc(e)}</option>`).join("")}</select>
+    <button class="ghost" data-a="hrefresh">Refresh</button><button class="ghost" data-a="hprint">Print / PDF</button></div></div>
+  <p class="hint">Every change is recorded with the login that made it. This record can't be edited or deleted, even by the admin. Tap a line to see the before and after values.</p>
+  ${h.error ? `<p class="warnbox">${esc(h.error)}</p>` : ""}
+  <div class="card" style="padding:4px 14px">${h.rows.length ? h.rows.map(r => `<details style="border-bottom:1px solid var(--line);padding:8px 0"><summary style="cursor:pointer;list-style:none;display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 12px">
+      <span class="num" style="color:var(--muted);font-size:13px">${new Date(r.at).toLocaleString("en-MY", {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"})}</span>
+      <span${r.action === "refused" ? ' style="color:var(--crit)"' : ""}>${esc(describe(r))}</span>
+      <span></span><small style="color:var(--muted)">${esc(r.email || "")}</small></summary>
+      <div class="receipt" style="margin-top:6px;font-size:12px">Before: ${esc(JSON.stringify(r.before, null, 1) || "—")}\nAfter: ${esc(JSON.stringify(r.after, null, 1) || "—")}</div></details>`).join("") : `<p class="empty">${h.loading ? "Loading…" : "Nothing recorded yet."}</p>`}</div>
+  ${h.rows.length && !h.done ? `<div class="acts" style="justify-content:center;margin-top:12px"><button class="ghost" data-a="hmore" ${h.loading ? "disabled" : ""}>${h.loading ? "Loading…" : "Show older"}</button></div>` : ""}`;
+}
+function historyHTML() {
+  const rows = (ui.hist && ui.hist.rows) || [];
+  return `<h1>${esc(S.settings.name)}: change history</h1><p class="muted">${ui.hist && ui.hist.email ? "Login " + esc(ui.hist.email) + " · " : ""}${rows.length} entries · printed ${new Date().toLocaleString("en-MY")}</p>
+  <table><thead><tr><th>When</th><th>Login</th><th>What changed</th></tr></thead><tbody>${rows.map(r => `<tr><td>${new Date(r.at).toLocaleString("en-MY")}</td><td>${esc(r.email || "")}</td><td>${esc(describe(r))}</td></tr>`).join("")}</tbody></table>`;
+}
+
 function viewSignIn() {
   const can = !!sb, first = ui.barExists === false;
   return `<form data-f="signin" data-k="${can}|${ui.barExists}" class="dialog" style="margin:24px auto">
@@ -819,6 +1106,7 @@ function viewSignIn() {
 function render() {
   $("#barname").textContent = S.settings.name || "My Bar";
   document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-current", b.dataset.v === ui.view));
+  const hb = document.querySelector('nav button[data-v="history"]'); if (hb) hb.hidden = !isAdmin();
   if (!user) {
     if (sb && ui.barExists === undefined) { ui.barExists = null; sb.rpc("bar_exists").then(r => { ui.barExists = r.error ? true : !!r.data; render(); }, () => { ui.barExists = true; render(); }); }
     const m = $("#main"), f = m.querySelector('form[data-f="signin"]');
@@ -829,7 +1117,8 @@ function render() {
   if (ui.tab && !S.tabs.tabs[ui.tab]) ui.tab = null;
   const m = $("#main"), y = m.scrollTop, act = document.activeElement, aid = act && m.contains(act) ? act.id : "";
   const typed = (m.querySelector("#f-tab") || {}).value || "";
-  m.innerHTML = ui.view === "stock" ? viewStock() : ui.view === "reports" ? viewReports() : viewOrders();
+  if (ui.view === "history" && !isAdmin()) ui.view = "orders";
+  m.innerHTML = ui.view === "stock" ? viewStock() : ui.view === "reports" ? viewReports() : ui.view === "history" ? viewHistory() : viewOrders();
   m.scrollTop = y;
   const inp = m.querySelector("#f-tab"); if (inp && typed) inp.value = typed;
   if (aid === "f-tab" || aid === "f-q") { const el = m.querySelector("#" + aid); if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) {} } }
@@ -1009,6 +1298,13 @@ function renderModal() {
         ${field("f-counted", "Cash counted in drawer (RM)", c.counted != null ? (c.counted / 100).toFixed(2) : "", "required " + dec)}
         <p id="diff" class="live w" style="grid-column:1/-1"></p>
         <div class="acts w"><button class="primary" type="submit">Save closing</button><button class="ghost" type="submit" data-print="1">Save and print</button><button class="ghost" type="button" data-a="close">Cancel</button></div></form>`;
+  } else if (m.kind === "closed") {
+    const c = (S.days[m.day] || {}).close; if (!c) { ui.modal = null; box.innerHTML = ""; return; }
+    const bk = {saving: "Saving a backup to the cloud…", ok: "✓ Backup saved to the cloud.", later: "Backup will be saved to the cloud as soon as the app is back online."}[m.backup] || "";
+    const ml = !S.settings.email ? (isAdmin() ? "Add the bar email in Setup to email this report." : "") : m.mail === "sending" ? "Emailing the report…" : m.mail === "sent" ? "✓ Report emailed to " + esc(S.settings.email) + "." : m.mail === "failed" ? "Automatic email failed. Use the Email button." : "";
+    h = `<h2>Day closed</h2><div class="receipt">${esc(closingText(m.day, c))}</div>
+      <p class="live">${bk}</p>${ml ? `<p class="live">${ml}</p>` : ""}
+      <div class="acts">${S.settings.email && m.mail !== "sent" ? `<button class="primary" data-a="mail-closing">Email report</button>` : ""}<button class="ghost" data-a="print-closing">Print</button><button class="ghost" data-a="close">Done</button></div>`;
   } else if (m.kind === "settings") {
     const s = S.settings, hh = s.hh || DEF.hh, D = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     h = `<h2>Bar setup</h2>${isAdmin() ? `<form data-f="settings" class="f">
@@ -1017,6 +1313,7 @@ function renderModal() {
       ${field("f-tax", "SST %", s.tax, 'type="number" step="0.5" min="0" max="30" inputmode="decimal"')}
       ${check("f-round", "Round cash totals to the nearest 5 sen", s.round5)}
       ${field("f-cut", "Business day ends at (hour after midnight, 0 to 12)", s.cut ?? 5, 'type="number" step="1" min="0" max="12" inputmode="numeric"', true)}
+      ${field("f-baremail", "Bar email (daily closing reports are sent here)", s.email || "", 'type="email" autocomplete="off" placeholder="bar@example.com"', true)}
       <h3 class="w" style="grid-column:1/-1;font-size:18px;margin-top:6px">Happy hour</h3>
       ${check("f-hhon", "Use happy hour prices automatically", hh.on)}
       ${field("f-hhfrom", "Starts", hh.from, 'type="time"')}
@@ -1039,6 +1336,11 @@ function renderModal() {
         <label for="f-lrole">Role<select id="f-lrole" name="f-lrole"><option value="viewer">Viewer: sees all, takes orders</option><option value="admin">Admin: full control</option></select></label>
         <p class="live w" id="loginmsg" style="grid-column:1/-1"></p>
         <div class="acts w"><button class="primary" type="submit" style="flex:none">Create login</button></div></form>` : ""}
+      ${isAdmin() ? `<h3 style="font-size:18px;margin-top:18px">Email</h3>
+      <p class="hint">${S.settings.email ? "Reports go to <b>" + esc(S.settings.email) + "</b>. " : "Set the bar email above. "}${ui.mailer ? "Automatic email is on: the day closing report is sent by itself." : "Automatic email isn't set up yet, so the Email buttons open this device's email app with the report filled in."}</p>
+      <h3 style="font-size:18px;margin-top:18px">Cloud backups</h3>
+      <p class="hint">A full backup is saved every time the day is closed. Backups can't be changed or deleted.</p>
+      ${ui.backups == null ? `<p class="hint">Loading…</p>` : ui.backups.length ? ui.backups.slice(0, 15).map(f => `<div class="selrow"><span>${esc(f.name.split("_")[0])} <small>${esc(new Date(f.created_at).toLocaleString("en-MY"))} · ${Math.max(1, Math.round((f.metadata && f.metadata.size || 0) / 1024))} KB</small></span><button class="ghost" data-a="backup-open" data-id="${esc(f.name)}">Download</button></div>`).join("") : `<p class="hint">No cloud backups yet. The first one is saved when the day is closed.</p>`}` : ""}
       <h3 style="font-size:18px;margin-top:18px">Backup</h3>
       <p class="hint">Your data is stored online and on each device. A backup file is still a good extra copy: download one now and then and keep it somewhere safe. This device holds the last ${KEEP_DAYS} days of sales, so that is what the backup includes. ${(() => { let t = 0; try { t = +localStorage.getItem(KEY + "lastBackup") || 0; } catch (_) {} return t ? "Last backup: " + new Date(t).toLocaleString() + "." : "No backup made yet."; })()}</p>
       <div class="acts"><button class="primary" style="flex:none" data-a="backup">Download backup</button>
@@ -1071,7 +1373,7 @@ document.addEventListener("click", e => {
   if (a === "veil") { if (e.target === el) modal(null); return; }
   if (["item-new", "item-edit", "item-del", "restock", "void", "void-yes", "reopen", "bill-void", "mock-add", "mock-del", "member-del"].includes(a) && !isAdmin()) { toast(ADMIN_ONLY); return; }
   switch (a) {
-    case "nav": ui.view = el.dataset.v; try { localStorage.setItem("bar-view", ui.view); } catch (_) {} $("#main").scrollTop = 0; break;
+    case "nav": ui.view = el.dataset.v; try { localStorage.setItem("bar-view", ui.view); } catch (_) {} $("#main").scrollTop = 0; if (ui.view === "history") { ui.hist = null; loadHistory(); } if (ui.view === "reports") ui.rep = null; break;
     case "tab": ui.tab = id; $("#main").scrollTop = 0; break;
     case "back": ui.tab = null; $("#main").scrollTop = 0; break;
     case "sort": ui.sort = id; break;
@@ -1114,7 +1416,6 @@ document.addEventListener("click", e => {
     case "item-edit": return modal("item", {id});
     case "item-del": S.menu.items = S.menu.items.filter(i => i.id !== id); saveMenu(); modal(null); break;
     case "restock": return modal("restock", {id});
-    case "range": ui.range = +id; break;
     case "bill": { const [day, bid] = id.split("|"); return modal("bill", {day, id: bid}); }
     case "bill-void": { const b = S.days[m.day].bills.find(x => x.id === m.id); b.void = true; saveDay(m.day); renderModal(); break; }
     case "reopen": reopenBill(m.day, m.id); modal(null); $("#main").scrollTop = 0; break;
@@ -1122,7 +1423,19 @@ document.addEventListener("click", e => {
     case "copy": { const txt = $("#receipt").textContent; (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => toast("Receipt copied"), () => toast("Copy is blocked here. Select the text instead.")); return; }
     case "print": { const b = ((S.days[m.day] || {}).bills || []).find(x => x.id === m.id); if (b) printText(receiptText(b), "bill-" + b.no); return; }
     case "print-open": { const t = curTab(); if (t && t.lines.length) printText(receiptText({open: true, t: Date.now(), tab: t.name, lines: t.lines, ...totals(t.lines, S.settings)}), "bill-" + t.name.replace(/[^A-Za-z0-9]+/g, "-").slice(0, 30)); return; }
-    case "settings": if (!user) return; if (isAdmin() && sb) { ui.members = null; loadMembers(); } return modal("settings", {});
+    case "settings": if (!user) return; if (isAdmin() && sb) { ui.members = null; ui.backups = null; loadMembers(); loadBackups(); } return modal("settings", {});
+    case "backup-open": openBackup(id); return;
+    case "rmode": ui.rmode = id; ui.rep = null; break;
+    case "rprev": shiftPeriod(-1); break;
+    case "rnext": shiftPeriod(1); break;
+    case "rnow": ui.ranchor = null; ui.rep = null; break;
+    case "rprint": printDoc(reportHTML(), period().title + " " + period().label); return;
+    case "remail": emailReport(); return;
+    case "hrefresh": ui.hist = null; loadHistory(); break;
+    case "hmore": loadHistory(true); return;
+    case "hprint": printDoc(historyHTML(), "change history"); return;
+    case "mail-closing": { const c = S.days[m.day].close; openMailApp(`${S.settings.name}: day closing ${m.day}`, closingText(m.day, c), "Day closing " + m.day); return; }
+    case "print-closing": printText(closingText(m.day, S.days[m.day].close)); logEvent("print", {what: "Day closing " + m.day}); return;
     case "member-del": {
       const x = (ui.members || []).find(z => z.user_id === id);
       if (!x || !window.confirm("Remove the login " + x.email + "? It will be signed out of the bar on every device.")) return;
@@ -1139,6 +1452,7 @@ document.addEventListener("click", e => {
 });
 document.addEventListener("input", e => {
   const id = e.target.id, m = ui.modal, t = curTab();
+  if (id === "f-hemail") { ui.hist = {rows: [], done: false, email: e.target.value}; loadHistory(); return; }
   if (id === "f-q") { ui.q = e.target.value; const c = $("#custs"); if (c) c.innerHTML = custCards(); }
   else if (id === "f-target" && m) m.target = e.target.value;
   else if (id === "f-newname" && m) m.newname = e.target.value;
@@ -1200,10 +1514,13 @@ document.addEventListener("submit", e => {
     const id = dayId(), day = S.days[id] || (S.days[id] = {bills: []});
     const fl = toSen(v("f-float")), counted = toSen(v("f-counted")), cash = summarise(day.bills).pay.cash;
     day.close = {t: Date.now(), float: fl, counted, cash, diff: counted - fl - cash};
-    saveDay(id);
+    commit();
     if (submitter && submitter.dataset.print) printText(closingText(id, day.close), "closing-" + id);
+    submitter = null;
+    modal("closed", {day: id}); render(); afterClose(id);
+    return;
   } else if (kind === "settings") {
-    S.settings = {name: v("f-bar") || "My Bar", svc: parseFloat(v("f-svc")) || 0, tax: parseFloat(v("f-tax")) || 0, round5: on("f-round"),
+    S.settings = {name: v("f-bar") || "My Bar", email: v("f-baremail"), svc: parseFloat(v("f-svc")) || 0, tax: parseFloat(v("f-tax")) || 0, round5: on("f-round"),
       cut: Math.max(0, Math.min(12, parseInt(v("f-cut"), 10) || 0)),
       hh: {on: on("f-hhon"), from: v("f-hhfrom") || "17:00", to: v("f-hhto") || "20:00", days: [0, 1, 2, 3, 4, 5, 6].filter(n => on("f-d" + n))}};
     saveSettings();
@@ -1215,7 +1532,7 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && ui.modal) 
 
 /* ---------- start ---------- */
 async function start() {
-  try { const v = localStorage.getItem("bar-view"); if (["orders", "stock", "reports"].includes(v)) ui.view = v; } catch (_) {}
+  try { const v = localStorage.getItem("bar-view"); if (["orders", "stock", "reports", "history"].includes(v)) ui.view = v; } catch (_) {}
   render();
   let lastHH = false;
   setInterval(() => { const now = hhOn(S.settings); if (now !== lastHH) { lastHH = now; if (!ui.modal) render(); } }, 30000);

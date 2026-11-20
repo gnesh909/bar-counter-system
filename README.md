@@ -18,6 +18,7 @@ An all-in-one counter app for a bar: customer tabs, orders, stock and sales repo
 | Setup (service charge, SST, happy hour), restore backup, test data | ✓ | |
 | Remove a customer without charging, void or reopen a bill | ✓ | |
 | Create and remove logins (Setup → Logins) | ✓ | |
+| See the change history (History tab) | ✓ | |
 
 The server enforces these rules, not just the screen.
 
@@ -30,6 +31,21 @@ Menu, stock, open customers and sales are stored in a private Supabase database 
 - **Privacy:** only the bar's own logins can read the data, and only within their role.
 - **Backup:** Setup → **Download backup** saves a file of the last 62 days. **Restore from backup** replaces the shared data on every device.
 - Supabase's free plan pauses a project after a week with no use at all. Daily use keeps it awake; if it ever pauses, it can be resumed from the Supabase dashboard.
+
+## Reports
+
+Reports → **Day / Week / Month / Year**, with ‹ › to move between periods. Each shows takings, gross profit, margin, bills, voids, payment methods and best sellers; Year adds a month-by-month table. Reports read all sales on the server, so past years are always available. **Print / PDF** opens Android's print screen (choose *Save as PDF* to keep a file); **Email** sends the report to the bar email.
+
+## Closing the day
+
+Reports → Day → **Close the day**. After saving, the app:
+
+1. saves a full backup of all bar data to private cloud storage (Supabase Storage). Backups can't be changed or deleted; the admin downloads them from Setup → Cloud backups. If the device is offline, the backup is saved as soon as it reconnects;
+2. emails the closing report to the bar email (Setup → Bar email). Until automatic email is set up, an **Email report** button opens the device's email app with the report filled in.
+
+## Change history
+
+Every change is recorded with the login email and time: menu, prices, stock, customers, bills, voids, closings, settings, logins, backups, printed and emailed reports, and anything the server refused. Only admins can read it (History tab), and nobody, including the admin, can edit or delete it.
 
 ## Printing
 
@@ -54,6 +70,6 @@ Menu, stock, open customers and sales are stored in a private Supabase database 
 | `sw.js` | Offline support |
 | `icon-192.png`, `icon-512.png` | App icons |
 
-The database has the tables `bars`, `bar_members` and `bar_docs` with row-level security; all writes go through the role-checked function `bar_put_many`.
+The database has the tables `bars`, `bar_members`, `bar_docs` and `bar_audit` (append-only) with row-level security; all writes go through the role-checked function `bar_put_many`, reports come from `bar_report`. Automatic email uses the Edge Function in `supabase/functions/send-report` with a `RESEND_API_KEY` secret.
 
 To update the app, change `index.html` and raise `VERSION` in `sw.js` so tablets pick up the new copy.
