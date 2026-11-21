@@ -35,6 +35,7 @@
 html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--ink);font:15px/1.45 var(--body);display:flex;flex-direction:column}
 button,input,select{font:inherit;color:inherit}
+[hidden]{display:none!important}
 button{cursor:pointer}
 :focus-visible{outline:2px solid var(--brass);outline-offset:2px}
 h1,h2,h3{font-family:var(--display);font-weight:800;letter-spacing:.02em;text-transform:uppercase;margin:0;text-wrap:balance}
@@ -237,6 +238,7 @@ const rm = sen => "RM " + (sen / 100).toLocaleString("en-MY", {minimumFractionDi
 const toSen = v => Math.round((parseFloat(v) || 0) * 100);
 const hhmm = t => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 const PAY = {cash: "Cash", card: "Card", ewallet: "E-wallet / QR"};
+const CATS = ["Beer", "Spirits", "Wine", "Cocktails", "Soft drinks", "Food", "Snacks", "Games", "Other"];
 const payName = k => PAY[k] || (k === "later" ? "Pay later" : k);
 
 /*PURE*/
@@ -1358,10 +1360,12 @@ function renderModal() {
   if (m.kind === "item") {
     const i = m.id ? item(m.id) : {name: "", cat: ui.cat === "All" ? "" : ui.cat, stock: 0, low: 5};
     const p = pours(i), cats = [...new Set(S.menu.items.map(x => x.cat).filter(Boolean))];
+    const curCat = i.cat || "Other", allCats = [...new Set([...CATS, ...cats, curCat])].sort((a, b) => (a === "Other") - (b === "Other") || a.localeCompare(b));
     const units = v => +((v || 0) / p).toFixed(2);
     h = `<h2>${m.id ? "Edit item" : "Add item"}</h2><form data-f="item" class="f">
       ${field("f-name", "Name", i.name, "required maxlength=40", true)}
-      ${field("f-cat", "Category", i.cat || "", 'list="catlist" maxlength=24 placeholder="Beer, Spirits, Food"', true)}<datalist id="catlist">${cats.map(c => `<option value="${esc(c)}">`).join("")}</datalist>
+      <label class="w" for="f-catsel">Category<select id="f-catsel" name="f-catsel">${allCats.map(c => `<option value="${esc(c)}"${c === curCat ? " selected" : ""}>${esc(c)}</option>`).join("")}<option value="__new">＋ New category…</option></select></label>
+      <label class="w" for="f-cat" id="newcat" hidden>New category name<input id="f-cat" name="f-cat" maxlength=24 placeholder="e.g. Shooters"></label>
       ${field("f-price", "Selling price (RM)", rmVal(i.price), "required " + dec)}
       ${field("f-hh", "Happy hour price (optional)", rmVal(i.hh), dec)}
       ${field("f-dbl", "Double price (optional)", rmVal(i.dbl), dec)}
@@ -1697,6 +1701,7 @@ document.addEventListener("input", e => {
   }
 });
 document.addEventListener("change", e => {
+  if (e.target.id === "f-catsel") { const nc = $("#newcat"), isNew = e.target.value === "__new"; nc.hidden = !isNew; $("#f-cat").required = isNew; if (isNew) $("#f-cat").focus(); return; }
   if (e.target.id === "f-restore" && !isAdmin()) { toast(ADMIN_ONLY); return; }
   if (e.target.id === "f-restore" && e.target.files && e.target.files[0]) { restoreData(e.target.files[0]); e.target.value = ""; }
 });
@@ -1759,7 +1764,7 @@ document.addEventListener("submit", e => {
   if ((kind === "item" || kind === "restock" || kind === "settings") && !isAdmin()) { toast(ADMIN_ONLY); modal(null); return; }
   if (kind === "item") {
     const p = Math.max(1, parseInt(v("f-pours"), 10) || 1), ucost = toSen(v("f-ucost"));
-    const d = {name: v("f-name"), cat: v("f-cat") || "Other", price: toSen(v("f-price")), hh: toSen(v("f-hh")), dbl: toSen(v("f-dbl")), pours: p, ucost, cost: Math.round(ucost / p),
+    const d = {name: v("f-name"), cat: tidy(v("f-catsel") === "__new" ? v("f-cat") : v("f-catsel")) || "Other", price: toSen(v("f-price")), hh: toSen(v("f-hh")), dbl: toSen(v("f-dbl")), pours: p, ucost, cost: Math.round(ucost / p),
       stock: Math.round((parseFloat(v("f-stock")) || 0) * p), low: Math.round((parseFloat(v("f-low")) || 0) * p), fav: on("f-fav"), nostock: on("f-nostock")};
     if (d.nostock) { d.stock = m.id ? (item(m.id).stock || 0) : 0; d.low = 0; }
     if (m.id) Object.assign(item(m.id), d); else S.menu.items.push({id: uid(), ...d});
