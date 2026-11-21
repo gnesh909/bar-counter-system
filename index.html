@@ -237,6 +237,7 @@ const rm = sen => "RM " + (sen / 100).toLocaleString("en-MY", {minimumFractionDi
 const toSen = v => Math.round((parseFloat(v) || 0) * 100);
 const hhmm = t => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 const PAY = {cash: "Cash", card: "Card", ewallet: "E-wallet / QR"};
+const payName = k => PAY[k] || (k === "later" ? "Pay later" : k);
 
 /*PURE*/
 function totals(lines, set, method) {
@@ -248,7 +249,7 @@ function totals(lines, set, method) {
   return {sub, svc, tax, round, total: raw + round};
 }
 function summarise(bills) {
-  const r = {sales: 0, net: 0, profit: 0, count: 0, voids: 0, units: 0, items: {}, ids: {}, pay: {cash: 0, card: 0, ewallet: 0}};
+  const r = {sales: 0, net: 0, profit: 0, count: 0, voids: 0, units: 0, items: {}, ids: {}, pay: {cash: 0, card: 0, ewallet: 0, later: 0}};
   for (const b of bills) {
     if (b.void) { r.voids++; continue; }
     r.count++; r.sales += b.total; r.net += b.sub;
@@ -335,6 +336,7 @@ function toDocs() {
     const day = S.days[id];
     for (const b of day.bills || []) d["bill/" + id + "/" + b.id] = b;
     if (day.close) d["close/" + id] = day.close;
+    for (const r of day.repays || []) d["repay/" + id + "/" + r.id] = r;
   }
   return d;
 }
@@ -349,6 +351,7 @@ function docsToState(src) {
     else if (p.startsWith("cust/")) custs[v.id] = clone(v);
     else if (p.startsWith("bill/")) dayOf(p.split("/")[1]).bills.push(clone(v));
     else if (p.startsWith("close/")) dayOf(p.slice(6)).close = clone(v);
+    else if (p.startsWith("repay/")) { const dd = dayOf(p.split("/")[1]); (dd.repays || (dd.repays = [])).push(clone(v)); }
   }
   items.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   for (const id in days) days[id].bills.sort((a, b) => a.t - b.t);
@@ -370,7 +373,7 @@ function commit() {
     const op = {path: p, data: b, delta: null};
     if (p.startsWith("item/")) { if (a) op.delta = (b.stock || 0) - (a.stock || 0); else op.isNew = true; }
     push(op); docs[p] = b;
-    if (p.startsWith("bill/") || p.startsWith("close/")) billsAt = Date.now();
+    if (p.startsWith("bill/") || p.startsWith("close/") || p.startsWith("repay/")) billsAt = Date.now();
   }
   for (const p in docs) if (!(p in next)) { push({path: p, data: docs[p], del: true, delta: null}); delete docs[p]; }
   lsSet("docs", docs); lsSet("queue", queue);
@@ -387,7 +390,7 @@ async function flush() {
     const {data: skipped, error} = await sb.rpc("bar_put_many", {p_bar: user.bar, p_ops: batch});
     if (error) throw error;
     queue.splice(0, inflight); inflight = 0; online = true; lsSet("queue", queue);
-    if (batch.some(o => o.path.startsWith("bill/") || o.path.startsWith("close/"))) billsAt = Date.now();
+    if (batch.some(o => /^(bill|close|repay)\//.test(o.path))) billsAt = Date.now();
     /* Changes this login isn't allowed to make are refused by the server: put back the real values. */
     if (skipped && skipped.length) toast(ADMIN_ONLY + " That change was undone.");
     refreshDocs([...new Set([...(skipped || []), ...batch.filter(o => o.path.startsWith("item/") && !o.del).map(o => o.path)])]).catch(() => {});
@@ -405,7 +408,7 @@ function applyRemote(row) {
   if (!row || !row.path) return;
   if (queue.some(q => q.path === row.path)) return; /* our newer change is on its way */
   if (row.deleted) delete docs[row.path]; else docs[row.path] = row.data;
-  if (row.path.startsWith("bill/") || row.path.startsWith("close/")) billsAt = Date.now();
+  if (row.path.startsWith("bill/") || row.path.startsWith("close/") || row.path.startsWith("repay/")) billsAt = Date.now();
   lsSet("docs", docs);
   fromDocs(); scheduleRender();
 }
@@ -427,7 +430,7 @@ async function fullLoad() {
   const cutId = dayId(cut);
   const rows = [];
   for (let from = 0; ; from += 1000) {
-    const {data, error} = await sb.from("bar_docs").select("path,data,deleted").eq("bar_id", user.bar).or(`path.not.like.bill/*,path.gte.bill/${cutId}`).range(from, from + 999);
+    const {data, error} = await sb.from("bar_docs").select("path,data,deleted").eq("bar_id", user.bar).or(`path.not.like.bill/*,path.gte.bill/${cutId},data->>pay.eq.later`).range(from, from + 999);
     if (error) throw error;
     rows.push(...data); if (data.length < 1000) break;
   }
@@ -587,6 +590,32 @@ const lkey = l => l.key || l.id;
 const pours = it => Math.max(1, it.pours || 1);
 const tracked = it => !!it && !it.nostock;
 const tidy = n => String(n || "").trim().replace(/\s+/g, " ");
+/* ---------- Pay later (unpaid bills of saved regulars) ---------- */
+function unpaidBills() {
+  const paid = {};
+  for (const id in S.days) for (const r of S.days[id].repays || []) paid[r.bill] = (paid[r.bill] || 0) + (+r.amt || 0);
+  const out = [];
+  for (const id in S.days) for (const b of S.days[id].bills || []) {
+    if (b.pay !== "later" || b.void) continue;
+    const ref = id + "/" + b.id, got = paid[ref] || 0, bal = b.total - got;
+    if (bal > 0) out.push({ref, day: id, bill: b, paid: got, bal});
+  }
+  return out.sort((a, b) => a.bill.t - b.bill.t);
+}
+const owedBy = cid => unpaidBills().filter(u => u.bill.cid === cid).reduce((a, u) => a + u.bal, 0);
+const ageDays = day => Math.max(0, Math.round((fromYmd(dayId()) - fromYmd(day)) / 864e5));
+const dayRepays = id => (S.days[id] || {}).repays || [];
+function addRepay(u, amt, pay) {
+  const id = dayId(), day = S.days[id] || (S.days[id] = {bills: []});
+  const r = {id: uid(), no: "R" + id.slice(5).replace("-", "") + "-" + pad(dayRepays(id).length + 1) + DEV, t: Date.now(), bill: u.ref, billNo: u.bill.no, cid: u.bill.cid, name: u.bill.tab, amt, pay};
+  (day.repays || (day.repays = [])).push(r);
+  saveDay(id);
+  return r;
+}
+function repayText(r, balAfter) {
+  const w = 34, row = (a, c) => a + " ".repeat(Math.max(1, w - a.length - c.length)) + c;
+  return [S.settings.name.toUpperCase(), "Payment received  " + new Date(r.t).toLocaleString(), r.name, "-".repeat(w), row("For bill " + (r.billNo || ""), ""), row("Paid by " + payName(r.pay), rm(r.amt)), row("Still owed", rm(Math.max(0, balAfter))), "-".repeat(w), "Thank you"].join("\n");
+}
 const findRegular = name => { const k = tidy(name).toLowerCase(); return Object.values(S.custs || {}).find(c => tidy(c.name).toLowerCase() === k) || null; };
 function makeTab(name) {
   const id = uid(), n = Object.keys(S.tabs.tabs).length + 1, reg = findRegular(name);
@@ -679,7 +708,7 @@ function receiptText(b) {
   if (b.tax) out.push(row("SST", rm(b.tax)));
   if (b.round) out.push(row("Rounding", rm(b.round)));
   out.push(row("TOTAL", rm(b.total)));
-  if (b.open) out.push("", "Not yet paid"); else out.push(row("Paid by", PAY[b.pay] || b.pay));
+  if (b.open) out.push("", "Not yet paid"); else if (b.pay === "later") out.push("", "NOT PAID: pay later", "Owed by " + b.tab); else out.push(row("Paid by", payName(b.pay)));
   if (b.tendered) out.push(row("Cash given", rm(b.tendered)), row("Change", rm(b.change)));
   if (b.reopened) out.push("*** REOPENED ***"); else if (b.void) out.push("*** VOIDED ***");
   return out.join("\n");
@@ -689,8 +718,11 @@ function closingText(id, c) {
   const r = summarise((S.days[id] || {}).bills || []);
   return [S.settings.name.toUpperCase(), "Day closing " + id, "Printed " + new Date().toLocaleString(), "-".repeat(w),
     row("Bills closed", String(r.count)), row("Voided or reopened", String(r.voids)), row("TOTAL takings", rm(r.sales)), "-".repeat(w),
-    row("Cash", rm(r.pay.cash)), row("Card", rm(r.pay.card)), row("E-wallet / QR", rm(r.pay.ewallet || 0)), "-".repeat(w),
-    row("Opening float", rm(c.float)), row("Cash expected", rm(c.float + r.pay.cash)), row("Cash counted", rm(c.counted)),
+    row("Cash", rm(r.pay.cash)), row("Card", rm(r.pay.card)), row("E-wallet / QR", rm(r.pay.ewallet || 0)),
+    ...(r.pay.later ? [row("Pay later (unpaid)", rm(r.pay.later))] : []),
+    ...(c.rep ? [row("Unpaid bills collected", rm(c.rep)), row("  of which cash", rm(c.repCash || 0))] : []),
+    ...(unpaidBills().length ? [row("Owed to the bar now", rm(unpaidBills().reduce((a, u) => a + u.bal, 0)))] : []), "-".repeat(w),
+    row("Opening float", rm(c.float)), row("Cash expected", rm(c.float + (c.cash ?? r.pay.cash))), row("Cash counted", rm(c.counted)),
     row(c.diff < 0 ? "SHORT" : c.diff > 0 ? "OVER" : "Balanced", rm(Math.abs(c.diff)))].join("\n");
 }
 /* Opens the device's own print screen with just the receipt text (works with Android print services and Bluetooth printer apps). */
@@ -750,6 +782,8 @@ function viewCustomers() {
       <datalist id="regulars">${Object.values(S.custs || {}).sort((a, b) => a.name.localeCompare(b.name)).map(c => `<option value="${esc(c.name)}">`).join("")}</datalist>
       <button class="primary" type="submit">Add customer</button>
     </form>
+    ${(() => { const ub = unpaidBills(); if (!ub.length) return ""; const tot = ub.reduce((a, u) => a + u.bal, 0), n = new Set(ub.map(u => u.bill.cid)).size, old = ub.some(u => ageDays(u.day) >= 7);
+      return `<div class="closebar" style="${old ? "border-left-color:var(--crit)" : ""}"><span><b>Unpaid bills:</b> <span class="num">${rm(tot)}</span> owed by ${n} regular${n === 1 ? "" : "s"}${old ? " · some over a week old" : ""}</span><button class="ghost" data-a="unpaid">View and collect</button></div>`; })()}
     <div class="bar"><h2>Customers in the bar</h2><span class="num" style="color:var(--muted)">${tabs.length} open · ${rm(open)} unpaid</span></div>
     ${tabs.length > 1 ? `<div class="tools"><input id="f-q" type="search" placeholder="Find a customer" aria-label="Find a customer" value="${esc(ui.q)}" autocomplete="off">
       <div class="seg" role="group" aria-label="Sort customers">${[["arrival", "Arrival"], ["name", "Name"], ["amount", "Amount"]].map(([k, l]) => `<button data-a="sort" data-id="${k}" aria-pressed="${ui.sort === k}">${l}</button>`).join("")}</div></div>` : ""}
@@ -843,6 +877,14 @@ function localReport(from, to, group) {
       }
     }
   }
+  for (const id in S.days) {
+    if (id < from || id > to) continue;
+    for (const p of S.days[id].repays || []) {
+      const k = group === "month" ? id.slice(0, 7) : id;
+      const r = rows[k] || (rows[k] = {k, sales: 0, net: 0, bills: 0, voids: 0, cash: 0, card: 0, ewallet: 0, profit: 0, cogs: 0, units: 0});
+      r.rep = (r.rep || 0) + p.amt; r["rep_" + p.pay] = (r["rep_" + p.pay] || 0) + p.amt;
+    }
+  }
   return {rows: Object.values(rows).sort((x, y) => x.k < y.k ? -1 : 1), items: Object.values(items).sort((x, y) => y.amt - x.amt).slice(0, 15)};
 }
 async function loadReport(P) {
@@ -902,7 +944,7 @@ async function openCustomer(r) {
   if (ui.modal && ui.modal.kind === "cust" && ui.modal.r === r) { ui.modal.bills = bills; renderModal(); }
 }
 function repTotals(rows) {
-  const t = {sales: 0, net: 0, bills: 0, voids: 0, cash: 0, card: 0, ewallet: 0, profit: 0, cogs: 0, units: 0};
+  const t = {sales: 0, net: 0, bills: 0, voids: 0, cash: 0, card: 0, ewallet: 0, later: 0, rep: 0, rep_cash: 0, rep_card: 0, rep_ewallet: 0, profit: 0, cogs: 0, units: 0};
   for (const r of rows) for (const k in t) t[k] += +r[k] || 0;
   return t;
 }
@@ -939,7 +981,9 @@ function viewReports() {
       <div class="days">${P.keys.map((k, i) => `<div class="${k === today ? "today" : ""}" style="height:${Math.round(vals[i] / maxV * 100)}%" title="${k}: ${rm(vals[i])}">${P.keys.length <= 12 && vals[i] ? `<b>${Math.round(vals[i] / 100)}</b>` : ""}</div>`).join("")}</div>
       <div class="axis"><span>${keyLabel(P.keys[0], P.group)}</span><span>Best ${rm(Math.max(0, ...vals))}</span><span>${keyLabel(P.keys[P.keys.length - 1], P.group)}</span></div></div>`}
     <div class="card"><h3>Best sellers</h3>${R.items.length ? R.items.slice(0, 8).map(v => `<div class="rank"><span>${esc(v.name)} <small style="color:var(--muted)">× ${+v.qty}</small></span><span class="num">${rm(+v.amt)}</span><i style="width:${Math.round(v.amt / maxTop * 100)}%"></i></div>`).join("") : `<p class="empty">No sales in this period.</p>`}</div>
-    <div class="card"><h3>How people paid</h3>${Object.entries(PAY).map(([k, l]) => `<div class="rank"><span>${l}</span><span class="num">${rm(T[k])}</span><i style="width:${Math.round(T[k] / payTotal * 100)}%"></i></div>`).join("")}
+    <div class="card"><h3>How people paid</h3>${Object.entries(PAY).concat([["later", "Pay later (unpaid)"]]).filter(([k]) => k !== "later" || T.later).map(([k, l]) => `<div class="rank"><span>${l}</span><span class="num">${rm(T[k])}</span><i style="width:${Math.round(T[k] / payTotal * 100)}%"></i></div>`).join("")}
+      ${T.rep ? `<div class="tot" style="margin-top:6px"><span>Unpaid bills collected</span><span class="num">${rm(T.rep)}</span></div>` : ""}
+      ${(() => { const ub = unpaidBills(); return ub.length ? `<div class="tot"><span>Owed to the bar now</span><button class="ghost" style="padding:2px 10px" data-a="unpaid">${rm(ub.reduce((a, u) => a + u.bal, 0))}</button></div>` : ""; })()}
       <h3 style="margin-top:16px">Needs restocking</h3>${lowItems.length ? lowItems.map(i => `<div class="tot"><span>${esc(i.name)}</span><span class="pill ${status(i)[0]}">${i.stock <= 0 ? "Out" : fmtStock(i) + " left"}</span></div>`).join("") : `<p style="color:var(--muted);margin:0">Everything is above its low level.</p>`}</div>
     ${isDay ? `<div class="card bills"><h3>Bills</h3>${dayBills.length ? dayBills.map(b => `<button data-a="bill" data-id="${P.from}|${b.id}" class="${b.void ? "void" : ""}"><span class="num">${hhmm(b.t)}</span><span>${esc(b.tab)}</span><span class="num">${rm(b.total)}</span></button>`).join("") : `<p class="empty">No bills on this device for this day.</p>`}</div>`
     : `<div class="card" style="grid-column:1/-1"><h3>${P.group === "month" ? "Month by month" : "Day by day"}</h3>${rowsTable ? `<div class="scroll" style="border:0"><table style="min-width:0"><thead><tr><th>${P.group === "month" ? "Month" : "Day"}</th><th class="r">Bills</th><th class="r">Takings</th><th class="r">Profit</th><th class="r">Margin</th></tr></thead><tbody>${rowsTable}
@@ -960,7 +1004,8 @@ function reportHTML() {
     ${row(["Takings", rm(T.sales)])}${row(["Net sales (before service charge and SST)", rm(T.net)])}${row(["Cost of items sold", rm(T.cogs)])}
     ${row(["<b>Gross profit</b>", "<b>" + rm(T.profit) + "</b>"])}${row(["Margin on items", (T.net ? Math.round(T.profit / T.net * 100) : 0) + "%"])}
     ${row(["Bills closed", T.bills])}${row(["Voided bills", T.voids])}${row(["Cash", rm(T.cash)])}${row(["Card", rm(T.card)])}${row(["E-wallet / QR", rm(T.ewallet)])}
-    ${closing ? row(["Opening float", rm(closing.float)]) + row(["Cash counted", rm(closing.counted)]) + row([closing.diff < 0 ? "Cash short" : closing.diff > 0 ? "Cash over" : "Cash balanced", rm(Math.abs(closing.diff))]) : ""}
+    ${T.later ? row(["Pay later (unpaid)", rm(T.later)]) : ""}${T.rep ? row(["Unpaid bills collected", rm(T.rep)]) : ""}${unpaidBills().length ? row(["Owed to the bar now", rm(unpaidBills().reduce((a, u) => a + u.bal, 0))]) : ""}
+    ${closing ? row(["Opening float", rm(closing.float)]) + row(["Cash expected", rm(closing.float + closing.cash)]) + row(["Cash counted", rm(closing.counted)]) + row([closing.diff < 0 ? "Cash short" : closing.diff > 0 ? "Cash over" : "Cash balanced", rm(Math.abs(closing.diff))]) : ""}
   </table>
   ${ui.rmode === "day" ? "" : `<h2 style="font-size:16px;margin:16px 0 6px">${P.group === "month" ? "Month by month" : "Day by day"}</h2>
   <table style="border-collapse:collapse;width:100%;font-size:13px">${row([P.group === "month" ? "Month" : "Day", "Bills", "Takings", "Profit"], true)}
@@ -977,6 +1022,8 @@ function reportText() {
   const line = (a, b) => a + " ".repeat(Math.max(1, w - a.length - String(b).length)) + b;
   const out = [S.settings.name.toUpperCase(), P.title, P.label, "-".repeat(w), line("Takings", rm(T.sales)), line("Gross profit", rm(T.profit)), line("Bills closed", T.bills), line("Voided", T.voids),
     line("Cash", rm(T.cash)), line("Card", rm(T.card)), line("E-wallet / QR", rm(T.ewallet))];
+  if (T.later) out.push(line("Pay later (unpaid)", rm(T.later)));
+  if (T.rep) out.push(line("Unpaid bills collected", rm(T.rep)));
   if (ui.rmode !== "day") { out.push("-".repeat(w)); for (const r of R.rows) out.push(line(keyLabel(r.k, P.group), rm(+r.sales))); }
   out.push("-".repeat(w), "Best sellers"); for (const i of R.items.slice(0, 10)) out.push(line(`${+i.qty} x ${i.name}`.slice(0, w - 12), rm(+i.amt)));
   const cs = ui.cust && ui.cust.key === ui.rmode + P.from ? ui.cust.rows : localCustomers(P.from, P.to);
@@ -1135,11 +1182,12 @@ function describe(h) {
     return `${n}: ${ch.join(", ") || "updated"}`;
   }
   if (p.startsWith("bill/")) {
-    if (h.action === "create") return `Bill ${a.no || ""} for ${a.tab || ""}: ${rm(+a.total || 0)} by ${PAY[a.pay] || a.pay}`;
+    if (h.action === "create") return ref + (a.pay === "later" ? `Put bill ${a.no || ""} for ★ ${a.tab || ""} on Pay later: ${rm(+a.total || 0)}` : `Bill ${a.no || ""} for ${a.tab || ""}: ${rm(+a.total || 0)} by ${payName(a.pay)}`);
     if (h.action === "delete") return `Deleted bill ${b.no || ""}`;
     if (a.void && !b.void) return ref + `${a.reopened ? "Reopened" : "Voided"} bill ${a.no || ""} for ${a.tab || ""} (${rm(+a.total || 0)})`;
     return ref + `Changed bill ${a.no || b.no || ""}`;
   }
+  if (p.startsWith("repay/")) return ref + `Collected ${rm(+a.amt || 0)} by ${payName(a.pay)} from ★ ${a.name || ""} for unpaid bill ${a.billNo || ""}`;
   if (p.startsWith("cust/")) {
     const n = a.name || b.name || "customer";
     if (h.action === "create") return ref + `Saved regular customer ${n}${a.phone ? " (" + a.phone + ")" : ""}`;
@@ -1356,12 +1404,36 @@ function renderModal() {
     const tt = totals(pickLines(t, m.sel), S.settings, m.method);
     h = `<h2>Take payment · ${esc(t.name)}</h2>${m.sel ? `<p class="hint">Selected items only. The rest stays on the bill.</p>` : ""}<div class="due num">${rm(tt.total)}</div>
       ${tt.round ? `<small style="color:var(--muted)">Includes ${rm(tt.round)} cash rounding to 5 sen</small>` : ""}
-      <div class="methods">${Object.entries(PAY).map(([k, l]) => `<button data-a="method" data-id="${k}" aria-pressed="${m.method === k}">${l}</button>`).join("")}</div>
+      <div class="methods" style="grid-template-columns:repeat(2,1fr)">${Object.entries(PAY).concat([["later", "Pay later"]]).map(([k, l]) => `<button data-a="method" data-id="${k}" aria-pressed="${m.method === k}">${l}</button>`).join("")}</div>
+      ${m.method === "later" ? (t.cid ? `<p class="hint">This goes on <b>★ ${esc(t.name)}</b>'s unpaid bills${owedBy(t.cid) ? ` (already owes ${rm(owedBy(t.cid))})` : ""}. Collect it later from Customers → Unpaid bills.</p>`
+        : Object.keys(S.custs).length ? `<div class="f"><label class="w" for="f-latercid">Pay later is only for saved regulars. Whose bill is this?<select id="f-latercid"><option value="">Choose a regular…</option>${Object.values(S.custs).sort((a, b) => a.name.localeCompare(b.name)).map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select></label></div>`
+        : `<p class="warnbox">Pay later is only for saved regulars, and none are saved yet. The admin adds them under Setup → Regular customers.</p>`) : ""}
       ${m.method === "cash" ? `<div class="f">${field("f-cash", "Cash given (RM)", "", dec, true)}</div>
         <div class="quick">${[...new Set([tt.total, ...[1000, 5000, 10000].map(n => Math.ceil(tt.total / n) * n)])].map(v => `<button class="ghost" data-a="cash" data-id="${v}">${rm(v)}</button>`).join("")}</div>
         <p id="change" class="live"></p>` : ""}
       <div class="f">${field("f-people", "Sharing equally? Number of people", "", 'inputmode="numeric" type="number" step="1" min="2" max="50"', true)}</div><p id="each" class="live"></p>
-      <div class="acts"><button class="primary" data-a="pay-yes">Paid, close bill</button><button class="ghost" data-a="close">Back</button></div>`;
+      <div class="acts"><button class="primary" data-a="pay-yes">${m.method === "later" ? "Put on Pay later" : "Paid, close bill"}</button><button class="ghost" data-a="close">Back</button></div>`;
+  } else if (m.kind === "unpaid") {
+    const list = unpaidBills(), by = {};
+    for (const u of list) (by[u.bill.cid || u.bill.tab] || (by[u.bill.cid || u.bill.tab] = [])).push(u);
+    const total = list.reduce((a, u) => a + u.bal, 0);
+    h = `<h2>Unpaid bills</h2><p class="hint">${list.length ? `${rm(total)} owed by ${Object.keys(by).length} customer${Object.keys(by).length === 1 ? "" : "s"}.` : "Nobody owes anything."}</p>
+      ${Object.values(by).sort((a, b) => b.reduce((x, u) => x + u.bal, 0) - a.reduce((x, u) => x + u.bal, 0)).map(us => { const c = S.custs[us[0].bill.cid];
+        return `<div style="border-top:1px solid var(--line);padding:10px 0"><div class="tot"><b>★ ${esc(c ? c.name : us[0].bill.tab)}${c && c.phone ? ` <small style="color:var(--muted);font-weight:400">${esc(c.phone)}</small>` : ""}</b><b class="num">${rm(us.reduce((x, u) => x + u.bal, 0))}</b></div>
+          ${us.map(u => `<div class="selrow"><span><span class="num">${keyLabel(u.day, "day")}</span> · ${esc(u.bill.no || "")} <small style="${ageDays(u.day) >= 7 ? "color:var(--crit)" : ""}">${ageDays(u.day)} day${ageDays(u.day) === 1 ? "" : "s"} ago</small><br><small>${rm(u.bill.total)}${u.paid ? " · paid " + rm(u.paid) : ""} · owes <b>${rm(u.bal)}</b></small></span><button class="primary" style="flex:none" data-a="repay" data-id="${esc(u.ref)}">Collect</button></div>`).join("")}</div>`; }).join("")}
+      <div class="acts"><button class="ghost" data-a="close">Close</button></div>`;
+  } else if (m.kind === "repay") {
+    const u = unpaidBills().find(x => x.ref === m.ref); if (!u) { ui.modal = null; box.innerHTML = ""; return; }
+    const method = m.method || "cash";
+    h = `<h2>Collect from ★ ${esc(u.bill.tab)}</h2><p class="hint">Bill ${esc(u.bill.no || "")} from ${keyLabel(u.day, "day")}: ${rm(u.bill.total)}${u.paid ? ", already paid " + rm(u.paid) : ""}.</p>
+      <div class="due num">${rm(u.bal)}</div><small style="color:var(--muted)">still owed</small>
+      <div class="methods">${Object.entries(PAY).map(([k, l]) => `<button data-a="rmethod" data-id="${k}" aria-pressed="${method === k}">${l}</button>`).join("")}</div>
+      <div class="f">${field("f-ramt", "Amount received (RM). Less than the full amount is fine.", (u.bal / 100).toFixed(2), dec + ' max="' + (u.bal / 100).toFixed(2) + '"', true)}</div>
+      <p class="live" id="repaymsg"></p>
+      <div class="acts"><button class="primary" data-a="repay-yes">Save payment</button><button class="ghost" data-a="unpaid">Back</button></div>`;
+  } else if (m.kind === "repaid") {
+    h = `<h2>Payment saved</h2><div class="receipt" id="receipt">${esc(m.text)}</div>
+      <div class="acts"><button class="primary" data-a="print-repay">Print receipt</button><button class="ghost" data-a="unpaid">Unpaid bills</button><button class="ghost" data-a="close">Done</button></div>`;
   } else if (m.kind === "bill") {
     const b = ((S.days[m.day] || {}).bills || []).find(x => x.id === m.id);
     if (!b) { ui.modal = null; box.innerHTML = ""; return; }
@@ -1378,8 +1450,10 @@ function renderModal() {
       <div class="tot"><span>Cash</span><span class="num">${rm(r.pay.cash)}</span></div>
       <div class="tot"><span>Card</span><span class="num">${rm(r.pay.card)}</span></div>
       <div class="tot"><span>E-wallet / QR</span><span class="num">${rm(r.pay.ewallet || 0)}</span></div>
+      ${r.pay.later ? `<div class="tot"><span>Pay later (not in the drawer)</span><span class="num">${rm(r.pay.later)}</span></div>` : ""}
+      ${dayRepays(id).length ? `<div class="tot"><span>Unpaid bills collected (cash ${rm(dayRepays(id).filter(x => x.pay === "cash").reduce((a, x) => a + x.amt, 0))})</span><span class="num">${rm(dayRepays(id).reduce((a, x) => a + x.amt, 0))}</span></div>` : ""}
       <div class="tot"><span>Bills closed · voided or reopened</span><span class="num">${r.count} · ${r.voids}</span></div>
-      <form data-f="close" class="f" style="margin-top:12px" data-cash="${r.pay.cash}">
+      <form data-f="close" class="f" style="margin-top:12px" data-cash="${r.pay.cash + dayRepays(id).filter(x => x.pay === "cash").reduce((a, x) => a + x.amt, 0)}">
         ${field("f-float", "Opening float (RM)", c.float != null ? (c.float / 100).toFixed(2) : "", dec)}
         ${field("f-counted", "Cash counted in drawer (RM)", c.counted != null ? (c.counted / 100).toFixed(2) : "", "required " + dec)}
         <p id="diff" class="live w" style="grid-column:1/-1"></p>
@@ -1391,8 +1465,9 @@ function renderModal() {
       <div class="tot"><span>Visits · bills</span><span class="num">${r.visits} · ${r.bills}</span></div>
       <div class="tot"><span>Average bill</span><span class="num">${rm(+r.avg)}</span></div>
       <div class="tot"><span>Favourites</span><span>${esc((r.fav || []).map(f => `${+f.qty} ${f.name}`).join(", ") || "—")}</span></div>
+      ${r.cid && owedBy(r.cid) ? `<div class="tot"><span style="color:var(--crit)">Owes the bar now</span><button class="ghost" style="padding:2px 10px" data-a="unpaid">${rm(owedBy(r.cid))}</button></div>` : ""}
       <h3 style="font-size:18px;margin:14px 0 6px">Bills</h3>
-      <div class="bills">${bills == null ? `<p class="hint">Loading…</p>` : bills.length ? bills.map(b => `<div style="padding:7px 0;border-bottom:1px solid var(--line)"><div class="tot"><span class="num">${keyLabel(b.day, "day")} ${hhmm(b.t)} · ${esc(b.no || "")}</span><b class="num">${rm(b.total)}</b></div><small style="color:var(--muted)">${esc((b.lines || []).map(l => l.qty + " " + l.name).join(", "))} · ${PAY[b.pay] || b.pay}</small></div>`).join("") : `<p class="hint">No bills found.</p>`}</div>
+      <div class="bills">${bills == null ? `<p class="hint">Loading…</p>` : bills.length ? bills.map(b => `<div style="padding:7px 0;border-bottom:1px solid var(--line)"><div class="tot"><span class="num">${keyLabel(b.day, "day")} ${hhmm(b.t)} · ${esc(b.no || "")}</span><b class="num">${rm(b.total)}</b></div><small style="color:var(--muted)">${esc((b.lines || []).map(l => l.qty + " " + l.name).join(", "))} · ${payName(b.pay)}</small></div>`).join("") : `<p class="hint">No bills found.</p>`}</div>
       <div class="acts"><button class="ghost" data-a="close">Close</button></div>`;
   } else if (m.kind === "newpass") {
     h = `<h2>Choose a new password</h2><form data-f="newpass" class="f">
@@ -1500,8 +1575,25 @@ document.addEventListener("click", e => {
     case "pay": return modal("pay", {method: "cash"});
     case "method": return modal("pay", {method: id, sel: m.sel});
     case "cash": { const i = $("#f-cash"); i.value = (id / 100).toFixed(2); i.dispatchEvent(new Event("input", {bubbles: true})); return; }
+    case "unpaid": return modal("unpaid", {});
+    case "repay": return modal("repay", {ref: id, method: "cash"});
+    case "rmethod": { const amt = ($("#f-ramt") || {}).value; modal("repay", {ref: m.ref, method: id}); const i = $("#f-ramt"); if (i && amt) i.value = amt; return; }
+    case "repay-yes": {
+      const u = unpaidBills().find(x => x.ref === m.ref); if (!u) return modal(null);
+      const amt = toSen(($("#f-ramt") || {}).value);
+      if (amt <= 0) { $("#repaymsg").textContent = "Enter the amount received."; return; }
+      if (amt > u.bal) { $("#repaymsg").textContent = "That's more than the " + rm(u.bal) + " owed."; return; }
+      const r = addRepay(u, amt, m.method || "cash");
+      render(); return modal("repaid", {text: repayText(r, u.bal - amt)});
+    }
+    case "print-repay": printText(m.text); return;
     case "pay-yes": {
       const t = curTab(); if (!t) return modal(null);
+      if (m.method === "later" && !t.cid) {
+        const c = S.custs[($("#f-latercid") || {}).value];
+        if (!c) { toast("Choose which regular this bill belongs to."); return; }
+        t.cid = c.id; t.name = c.name; saveTabs();
+      }
       const due = totals(pickLines(t, m.sel), S.settings, m.method).total;
       const given = m.method === "cash" ? toSen(($("#f-cash") || {}).value) : 0;
       if (given && given < due) { $("#change").textContent = "That is " + rm(due - given) + " short."; return; }
@@ -1678,8 +1770,9 @@ document.addEventListener("submit", e => {
     if (m && m.rename && curTab()) { const t = curTab(), reg = findRegular(v("f-tab")); t.name = reg ? reg.name : tidy(v("f-tab")); if (reg) t.cid = reg.id; else delete t.cid; saveTabs(); } else { newTab(v("f-tab")); f.reset(); }
   } else if (kind === "close") {
     const id = dayId(), day = S.days[id] || (S.days[id] = {bills: []});
-    const fl = toSen(v("f-float")), counted = toSen(v("f-counted")), cash = summarise(day.bills).pay.cash;
-    day.close = {t: Date.now(), float: fl, counted, cash, diff: counted - fl - cash};
+    const rp = dayRepays(id), repCash = rp.filter(r => r.pay === "cash").reduce((a, r) => a + r.amt, 0);
+    const sm = summarise(day.bills), fl = toSen(v("f-float")), counted = toSen(v("f-counted")), cash = sm.pay.cash + repCash;
+    day.close = {t: Date.now(), float: fl, counted, cash, later: sm.pay.later, rep: rp.reduce((a, r) => a + r.amt, 0), repCash, diff: counted - fl - cash};
     commit();
     if (submitter && submitter.dataset.print) printText(closingText(id, day.close), "closing-" + id);
     submitter = null;

@@ -49,6 +49,16 @@ Reports → any Day / Week / Month / Year → **Customer spending**: visits, bil
 
 **Regular customers** (Setup → Regular customers, admin): saved regulars appear as suggestions when a name is typed at the counter, so their spending always adds up under one name. They're marked ★, and **Showing regulars only** filters the report to them.
 
+## Pay later (unpaid bills)
+
+For saved regulars only (both logins can use it; the server refuses it for anyone else).
+
+1. **Take payment → Pay later**. If the customer isn't linked to a regular yet, pick which regular it is. The receipt prints *NOT PAID: pay later*.
+2. The bill counts as a sale that night (so takings and profit match the stock used), shows as *Pay later* in the closing report, and is not expected in the cash drawer.
+3. Customers → **Unpaid bills** lists who owes what and for how long (red after 7 days). **Collect** takes full or part payment by cash, card or e-wallet and prints a payment receipt.
+4. Money collected appears as *Unpaid bills collected* in that day's closing, and cash collected is added to the cash expected. It isn't counted as a sale twice.
+5. Reports and the closing report show the total owed to the bar. Every Pay later and payment is in the change history.
+
 ## Services without stock (pool table)
 
 Stock → Add item → tick **Don't track stock** for things like a pool game, karaoke or corkage. These sell like any item but have no stock count, never show as Out or Low, and are left out of restocking and stock value.
